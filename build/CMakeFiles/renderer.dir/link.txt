@@ -1,0 +1,1 @@
+/usr/bin/g++-12 -O3 -DNDEBUG CMakeFiles/renderer.dir/src/main.cpp.o -o renderer  -Wl,-rpath,/usr/local/cuda-12.5/targets/x86_64-linux/lib /usr/local/cuda-12.5/targets/x86_64-linux/lib/stubs/libcuda.so /usr/local/cuda-12.5/targets/x86_64-linux/lib/libcudart.so 
