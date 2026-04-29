@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/g++-12
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/mestay/optix/include -I/home/mestay/renderer/src -isystem /usr/local/cuda-12.5/targets/x86_64-linux/include
+CXX_INCLUDES = -I/home/mestay/optix/include -I/home/mestay/renderer/src -I/home/mestay/renderer/include -isystem /usr/local/cuda-12.5/targets/x86_64-linux/include
 
 CXX_FLAGS = -O3 -DNDEBUG
 
