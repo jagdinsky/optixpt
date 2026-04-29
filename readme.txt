@@ -5,3 +5,5 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPIL
 make -j$(nproc)
 
 ./renderer
+
+eog output.ppm

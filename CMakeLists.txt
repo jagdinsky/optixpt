@@ -18,6 +18,7 @@ add_executable(renderer src/main.cpp)
 target_include_directories(renderer PRIVATE
     ${OptiX_INCLUDE}
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
 )
 target_link_libraries(renderer
     CUDA::cuda_driver
