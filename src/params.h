@@ -3,39 +3,34 @@
 #include <optix.h>
 #include <vector_types.h>
 
-struct Triangle
-{
+struct Triangle {
     float3 v0, v1, v2; // vertices
     float3 n0, n1, n2; // per-vertex normals (for interpolation)
     int mat_id;
 };
 
-struct Material
-{
+struct Material {
     float3 albedo;
     float3 emission;
 };
 
-struct Params
-{
+struct Params {
     // ── Output buffers ────────────────────────────────────────────────────────
-    uchar4 *frame_buffer;
+    uchar4* frame_buffer;
     // The final image: one uchar4 (R,G,B,A bytes 0-255) per pixel.
     // Written at the very end of raygen after averaging + gamma correction.
     // This is what gets saved to output.ppm.
-    float3 *accum_buffer;
+    float3* accum_buffer;
     // A floating-point accumulation buffer — one float3 per pixel.
     // Exists for progressive rendering: if you render 64 samples across
     // multiple launches (e.g. 4 launches × 16 samples), you ADD each
     // launch's result here instead of overwriting. At display time you
-    // divide by total samples. Right now we don't use it yet (all 64
-    // samples happen in one launch), but it's here for when we add
-    // interactive progressive rendering later.
+    // divide by total samples.
     unsigned width;
     unsigned height;
     OptixTraversableHandle handle;
     // The BVH handle — this is what optixTrace uses to traverse the scene.
-    // Think of it as a pointer to your GPU-side acceleration structure.
+    // Considered as a pointer to your GPU-side acceleration structure.
 
     // ── Camera ────────────────────────────────────────────────────────────────
     float3 cam_eye;
@@ -62,6 +57,6 @@ struct Params
     int frame_index;
 
     // ── Scene data pointers ─────────────────────────────────────────────────
-    Triangle *triangles;
-    Material *materials;    
+    Triangle* triangles;
+    Material* materials;
 };

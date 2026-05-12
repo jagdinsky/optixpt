@@ -92,8 +92,12 @@ renderer_EXTERNAL_OBJECTS =
 
 renderer: CMakeFiles/renderer.dir/src/main.cpp.o
 renderer: CMakeFiles/renderer.dir/build.make
-renderer: /usr/local/cuda-12.5/targets/x86_64-linux/lib/stubs/libcuda.so
-renderer: /usr/local/cuda-12.5/targets/x86_64-linux/lib/libcudart.so
+renderer: /usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs/libcuda.so
+renderer: /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcudart.so
+renderer: /usr/lib/x86_64-linux-gnu/libglfw.so.3.3
+renderer: /usr/lib/x86_64-linux-gnu/libGLEW.so
+renderer: /usr/lib/x86_64-linux-gnu/libGLX.so
+renderer: /usr/lib/x86_64-linux-gnu/libOpenGL.so
 renderer: CMakeFiles/renderer.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/mestay/renderer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable renderer"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/renderer.dir/link.txt --verbose=$(VERBOSE)

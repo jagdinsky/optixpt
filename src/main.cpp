@@ -1,597 +1,708 @@
+#include "params.h"
 #include <cuda_runtime.h>
 #include <optix.h>
 #include <optix_function_table_definition.h>
 #include <optix_stubs.h>
 
-#include "params.h" // your own params struct
+// GLEW must come before any GL header. GLFW_INCLUDE_NONE prevents GLFW from
+// pulling in gl.h/glext.h on its own, which would conflict with GLEW.
+#include <GL/glew.h>
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+#include <cuda_gl_interop.h>
 
-#define TINYOBJLOADER_IMPLEMENTATION
-#include "tiny_obj_loader.h"
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "tiny_gltf.h"
 
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
-#define CUDA_CHECK(call)                                       \
-    do                                                         \
-    {                                                          \
-        cudaError_t err = call;                                \
-        if (err != cudaSuccess)                                \
-        {                                                      \
-            std::cerr << "CUDA error at " << __FILE__ << ":"   \
-                      << __LINE__ << " — "                     \
-                      << cudaGetErrorString(err) << std::endl; \
-            exit(1);                                           \
-        }                                                      \
+// ── Error macros ─────────────────────────────────────────────────────────────
+#define CUDA_CHECK(call)                                                                                       \
+    do {                                                                                                       \
+        cudaError_t e = (call);                                                                                \
+        if (e != cudaSuccess) {                                                                                \
+            std::cerr << "CUDA error " << __FILE__ << ":" << __LINE__ << " " << cudaGetErrorString(e) << "\n"; \
+            exit(1);                                                                                           \
+        }                                                                                                      \
     } while (0)
 
-#define OPTIX_CHECK(call)                                       \
-    do                                                          \
-    {                                                           \
-        OptixResult res = call;                                 \
-        if (res != OPTIX_SUCCESS)                               \
-        {                                                       \
-            std::cerr << "OptiX error at " << __FILE__ << ":"   \
-                      << __LINE__ << " — "                      \
-                      << optixGetErrorString(res) << std::endl; \
-            exit(1);                                            \
-        }                                                       \
+#define OPTIX_CHECK(call)                                                                                        \
+    do {                                                                                                         \
+        OptixResult r = (call);                                                                                  \
+        if (r != OPTIX_SUCCESS) {                                                                                \
+            std::cerr << "OptiX error " << __FILE__ << ":" << __LINE__ << " " << optixGetErrorString(r) << "\n"; \
+            exit(1);                                                                                             \
+        }                                                                                                        \
     } while (0)
 
+#define GL_CHECK()                                                                       \
+    do {                                                                                 \
+        GLenum e = glGetError();                                                         \
+        if (e != GL_NO_ERROR) {                                                          \
+            std::cerr << "GL error " << __FILE__ << ":" << __LINE__ << " " << e << "\n"; \
+            exit(1);                                                                     \
+        }                                                                                \
+    } while (0)
+
+// ── Host-side float3 math (device.cu operators are __device__ only) ──────────
+inline float3 operator+(float3 a, float3 b) { return make_float3(a.x + b.x, a.y + b.y, a.z + b.z); }
+inline float3 operator-(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
+inline float3 operator*(float t, float3 v) { return make_float3(t * v.x, t * v.y, t * v.z); }
+inline float3 operator*(float3 v, float t) { return make_float3(t * v.x, t * v.y, t * v.z); }
+inline float3& operator+=(float3& a, float3 b)
+{
+    a.x += b.x;
+    a.y += b.y;
+    a.z += b.z;
+    return a;
+}
+inline float3& operator-=(float3& a, float3 b)
+{
+    a.x -= b.x;
+    a.y -= b.y;
+    a.z -= b.z;
+    return a;
+}
+inline float dot(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline float3 cross(float3 a, float3 b) { return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+inline float3 normalize(float3 v)
+{
+    float inv = 1.f / sqrtf(dot(v, v));
+    return inv * v;
+}
+
+// ── Renderer state ───────────────────────────────────────────────────────────
 struct RendererState {
-    OptixDeviceContext context;                           // connection to the GPU
-    OptixTraversableHandle gas_handle;                    // the BVH (scene acceleration structure)
-    CUdeviceptr d_gas_output_buffer;                      // GPU memory for the BVH
-    CUdeviceptr d_vertices;                               // GPU memory for vertex data
-    OptixModule ptx_module;                               // compiled GPU code
-    OptixPipelineCompileOptions pipeline_compile_options; // options for pipeline compilation   
-    OptixPipeline pipeline;                               // the full ray tracing pipeline
-    OptixShaderBindingTable sbt;                          // maps rays to shaders
-    Params *d_params;                                     // launch parameters on GPU
-    OptixProgramGroup raygen_group;                       // ray generation program group
-    OptixProgramGroup miss_group;                         // miss program group
-    OptixProgramGroup hit_group;                          // hit program group
-    CUdeviceptr d_triangles;                              // GPU memory for triangle data
-    CUdeviceptr d_materials;                              // GPU memory for material data
-    uint32_t num_vertices;                                // number of vertices
-    uint32_t num_materials;                               // number of materials
-    std::vector<Material> host_materials;                 // host copy of materials for SBT population
-    std::vector<uint32_t> sbt_offsets;                    // per-triangle mat_id, built at upload time
+    OptixDeviceContext context;
+    OptixTraversableHandle gasHandle;
+    CUdeviceptr dGasOutputBuffer;
+    CUdeviceptr dVertices;
+    OptixModule ptxModule;
+    OptixPipelineCompileOptions pipelineCompileOptions;
+    OptixPipeline pipeline;
+    OptixShaderBindingTable sbt;
+    CUdeviceptr dParams;
+    OptixProgramGroup raygenGroup;
+    OptixProgramGroup missGroup;
+    OptixProgramGroup hitGroup;
+    CUdeviceptr dTriangles;
+    CUdeviceptr dMaterials;
+    uint32_t numVertices;
+    uint32_t numMaterials;
+    std::vector<Material> hostMaterials;
+    std::vector<uint32_t> sbtOffsets;
 };
 
-struct Scene
-{
+struct Scene {
     std::vector<Triangle> triangles;
     std::vector<Material> materials;
 };
 
-void loadScene(const std::string &basename, Scene &scene)
+// ── glTF helpers ─────────────────────────────────────────────────────────────
+static float3 gltfFloat3(const tinygltf::Model& model,
+    const tinygltf::Accessor& acc, size_t i)
 {
-    const std::string scenes_dir = "../scenes/";
-    const std::string obj_path = scenes_dir + basename + ".obj";
-    const std::string mtl_dir = scenes_dir; // tinyobj looks here for the .mtl
+    const auto& bv = model.bufferViews[acc.bufferView];
+    const auto& buf = model.buffers[bv.buffer];
+    size_t stride = acc.ByteStride(bv) ? acc.ByteStride(bv) : sizeof(float3);
+    const float* p = reinterpret_cast<const float*>(
+        buf.data.data() + bv.byteOffset + acc.byteOffset + i * stride);
+    return make_float3(p[0], p[1], p[2]);
+}
 
-    tinyobj::attrib_t attrib;
-    std::vector<tinyobj::shape_t> shapes;
-    std::vector<tinyobj::material_t> materials;
-    std::string warn, err;
-
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
-                          obj_path.c_str(), mtl_dir.c_str()))
-        throw std::runtime_error(warn + err);
-
-    if (!warn.empty())
-        std::cerr << "[tinyobj] " << warn << "\n";
-    std::cout << "Loaded " << basename << ".obj — "
-              << shapes.size() << " shape(s), "
-              << materials.size() << " material(s)\n";
-
-    // ── Triangles ──────────────────────────────────────────────────────────
-    for (const auto &shape : shapes)
-    {
-        for (size_t i = 0; i < shape.mesh.indices.size(); i += 3)
-        {
-            auto idx0 = shape.mesh.indices[i + 0];
-            auto idx1 = shape.mesh.indices[i + 1];
-            auto idx2 = shape.mesh.indices[i + 2];
-
-            Triangle tri = {};
-            tri.v0 = make_float3(attrib.vertices[3 * idx0.vertex_index],
-                                 attrib.vertices[3 * idx0.vertex_index + 1],
-                                 attrib.vertices[3 * idx0.vertex_index + 2]);
-            tri.v1 = make_float3(attrib.vertices[3 * idx1.vertex_index],
-                                 attrib.vertices[3 * idx1.vertex_index + 1],
-                                 attrib.vertices[3 * idx1.vertex_index + 2]);
-            tri.v2 = make_float3(attrib.vertices[3 * idx2.vertex_index],
-                                 attrib.vertices[3 * idx2.vertex_index + 1],
-                                 attrib.vertices[3 * idx2.vertex_index + 2]);
-
-            if (idx0.normal_index >= 0)
-                tri.n0 = make_float3(attrib.normals[3 * idx0.normal_index],
-                                     attrib.normals[3 * idx0.normal_index + 1],
-                                     attrib.normals[3 * idx0.normal_index + 2]);
-            if (idx1.normal_index >= 0)
-                tri.n1 = make_float3(attrib.normals[3 * idx1.normal_index],
-                                     attrib.normals[3 * idx1.normal_index + 1],
-                                     attrib.normals[3 * idx1.normal_index + 2]);
-            if (idx2.normal_index >= 0)
-                tri.n2 = make_float3(attrib.normals[3 * idx2.normal_index],
-                                     attrib.normals[3 * idx2.normal_index + 1],
-                                     attrib.normals[3 * idx2.normal_index + 2]);
-
-            tri.mat_id = std::max(0, shape.mesh.material_ids[i / 3]);
-            scene.triangles.push_back(tri);
-        }
+static uint32_t gltfIndex(const tinygltf::Model& model,
+    const tinygltf::Accessor& acc, size_t i)
+{
+    const auto& bv = model.bufferViews[acc.bufferView];
+    const auto& buf = model.buffers[bv.buffer];
+    const uint8_t* base = buf.data.data() + bv.byteOffset + acc.byteOffset;
+    switch (acc.componentType) {
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+        return base[i];
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+        return reinterpret_cast<const uint16_t*>(base)[i];
+    default:
+        return reinterpret_cast<const uint32_t*>(base)[i];
     }
+}
 
-    // ── Materials ──────────────────────────────────────────────────────────
-    for (const auto &mat : materials)
-    {
+// ── Scene loader ─────────────────────────────────────────────────────────────
+void loadScene(const std::string& filename, Scene& scene)
+{
+    const std::string filepath = "../scenes/" + filename;
+    tinygltf::Model model;
+    tinygltf::TinyGLTF loader;
+    std::string warn, err;
+    bool ok = (filename.size() >= 4 && filename.compare(filename.size() - 4, 4, ".glb") == 0)
+        ? loader.LoadBinaryFromFile(&model, &err, &warn, filepath)
+        : loader.LoadASCIIFromFile(&model, &err, &warn, filepath);
+    if (!warn.empty())
+        std::cerr << "[tinyGLTF warn] " << warn << "\n";
+    if (!ok)
+        throw std::runtime_error("[tinyGLTF error] " + err);
+
+    for (const auto& gmat : model.materials) {
         Material m;
-        m.albedo = make_float3(mat.diffuse[0], mat.diffuse[1], mat.diffuse[2]);
-        m.emission = make_float3(mat.emission[0], mat.emission[1], mat.emission[2]);
+        const auto& pbr = gmat.pbrMetallicRoughness;
+        float r = (float)pbr.baseColorFactor[0], g = (float)pbr.baseColorFactor[1], b = (float)pbr.baseColorFactor[2];
+        if (r > 0.99f && g > 0.99f && b > 0.99f && pbr.baseColorTexture.index >= 0) {
+            static const float3 dc[] = { { 0.80f, 0.35f, 0.15f }, { 0.70f, 0.30f, 0.10f },
+                { 0.20f, 0.20f, 0.20f }, { 1.00f, 0.95f, 0.60f }, { 0.60f, 0.85f, 1.00f } };
+            int idx = (int)(&gmat - &model.materials[0]);
+            m.albedo = dc[std::min(idx, 4)];
+        } else {
+            m.albedo = make_float3(r, g, b);
+        }
+        m.emission = make_float3((float)gmat.emissiveFactor[0],
+            (float)gmat.emissiveFactor[1],
+            (float)gmat.emissiveFactor[2]);
         scene.materials.push_back(m);
     }
-
-    // Guarantee at least one material
-    if (scene.materials.empty())
-    {
-        Material fallback;
-        fallback.albedo = make_float3(0.6f, 0.4f, 0.2f);
-        fallback.emission = make_float3(0.f, 0.f, 0.f);
-        scene.materials.push_back(fallback);
-        std::cerr << "[warn] No materials found — using fallback brown\n";
+    if (scene.materials.empty()) {
+        Material f;
+        f.albedo = make_float3(0.6f, 0.4f, 0.2f);
+        f.emission = make_float3(0, 0, 0);
+        scene.materials.push_back(f);
     }
+    const int maxMat = (int)scene.materials.size() - 1;
 
-    // Clamp all mat_ids to valid range
-    int max_id = (int)scene.materials.size() - 1;
-    for (auto &tri : scene.triangles)
-        tri.mat_id = std::min(tri.mat_id, max_id);
+    auto flatNormal = [](float3 v0, float3 v1, float3 v2) {
+        float3 e1 = v1 - v0, e2 = v2 - v0;
+        float3 n = cross(e1, e2);
+        float len = sqrtf(dot(n, n));
+        return len > 0 ? (1.f / len) * n : make_float3(0, 1, 0);
+    };
+
+    for (const auto& mesh : model.meshes) {
+        for (const auto& prim : mesh.primitives) {
+            if (prim.mode != TINYGLTF_MODE_TRIANGLES && prim.mode != -1)
+                continue;
+            auto posIt = prim.attributes.find("POSITION");
+            if (posIt == prim.attributes.end())
+                continue;
+            const auto& posAcc = model.accessors[posIt->second];
+            bool hasN = false;
+            tinygltf::Accessor normAcc;
+            auto normIt = prim.attributes.find("NORMAL");
+            if (normIt != prim.attributes.end()) {
+                normAcc = model.accessors[normIt->second];
+                hasN = true;
+            }
+            int matId = (prim.material >= 0) ? std::min(prim.material, maxMat) : 0;
+
+            auto makeTri = [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+                Triangle tri;
+                tri.v0 = gltfFloat3(model, posAcc, i0);
+                tri.v1 = gltfFloat3(model, posAcc, i1);
+                tri.v2 = gltfFloat3(model, posAcc, i2);
+                if (hasN) {
+                    tri.n0 = gltfFloat3(model, normAcc, i0);
+                    tri.n1 = gltfFloat3(model, normAcc, i1);
+                    tri.n2 = gltfFloat3(model, normAcc, i2);
+                } else {
+                    tri.n0 = tri.n1 = tri.n2 = flatNormal(tri.v0, tri.v1, tri.v2);
+                }
+                tri.mat_id = matId;
+                scene.triangles.push_back(tri);
+            };
+
+            if (prim.indices >= 0) {
+                const auto& idxAcc = model.accessors[prim.indices];
+                for (size_t t = 0; t < idxAcc.count / 3; ++t)
+                    makeTri(gltfIndex(model, idxAcc, t * 3 + 0),
+                        gltfIndex(model, idxAcc, t * 3 + 1),
+                        gltfIndex(model, idxAcc, t * 3 + 2));
+            } else {
+                for (size_t t = 0; t < posAcc.count / 3; ++t)
+                    makeTri((uint32_t)(t * 3), (uint32_t)(t * 3 + 1), (uint32_t)(t * 3 + 2));
+            }
+        }
+    }
+    std::cout << "Loaded " << filename << "  tri=" << scene.triangles.size()
+              << "  mat=" << scene.materials.size() << "\n";
 }
 
-void uploadBuffersToGPU(RendererState &state, const Scene &scene)
+// ── GPU uploads ──────────────────────────────────────────────────────────────
+void uploadBuffersToGPU(RendererState& state, const Scene& scene)
 {
-    size_t tri_bytes = scene.triangles.size() * sizeof(Triangle);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&state.d_triangles), tri_bytes));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(state.d_triangles),
-                          scene.triangles.data(), tri_bytes, cudaMemcpyHostToDevice));
-
-    size_t mat_bytes = scene.materials.size() * sizeof(Material);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&state.d_materials), mat_bytes));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(state.d_materials),
-                          scene.materials.data(), mat_bytes, cudaMemcpyHostToDevice));
-
-    std::vector<float3> vertices;
-    vertices.reserve(scene.triangles.size() * 3);
-    for (auto &tri : scene.triangles)
-    {
-        vertices.push_back(tri.v0);
-        vertices.push_back(tri.v1);
-        vertices.push_back(tri.v2);
+    size_t tb = scene.triangles.size() * sizeof(Triangle);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dTriangles), tb));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dTriangles), scene.triangles.data(), tb, cudaMemcpyHostToDevice));
+    size_t mb = scene.materials.size() * sizeof(Material);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dMaterials), mb));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dMaterials), scene.materials.data(), mb, cudaMemcpyHostToDevice));
+    std::vector<float3> verts;
+    verts.reserve(scene.triangles.size() * 3);
+    for (const auto& t : scene.triangles) {
+        verts.push_back(t.v0);
+        verts.push_back(t.v1);
+        verts.push_back(t.v2);
     }
-    size_t vert_bytes = vertices.size() * sizeof(float3);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&state.d_vertices), vert_bytes));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(state.d_vertices),
-                          vertices.data(), vert_bytes, cudaMemcpyHostToDevice));
-    state.num_vertices = (uint32_t)vertices.size();
-    state.num_materials = (uint32_t)scene.materials.size();
-    state.host_materials = scene.materials;
-    state.sbt_offsets.reserve(scene.triangles.size());
-    for (const auto &tri : scene.triangles)
-        state.sbt_offsets.push_back((uint32_t)tri.mat_id);
+    size_t vb = verts.size() * sizeof(float3);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dVertices), vb));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dVertices), verts.data(), vb, cudaMemcpyHostToDevice));
+    state.numVertices = (uint32_t)verts.size();
+    state.numMaterials = (uint32_t)scene.materials.size();
+    state.hostMaterials = scene.materials;
+    state.sbtOffsets.reserve(scene.triangles.size());
+    for (const auto& t : scene.triangles)
+        state.sbtOffsets.push_back((uint32_t)t.mat_id);
 }
 
-void createContext(RendererState &state)
+// ── OptiX setup (unchanged logic) ────────────────────────────────────────────
+void createContext(RendererState& state)
 {
+    // On Optimus laptops the NVIDIA GPU is always CUDA device 0.
+    // Force it before cudaFree(0) so CUDA initialises on the same device
+    // that owns the GL context (which initGL() already forced to NVIDIA).
+    CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaFree(0));
     OPTIX_CHECK(optixInit());
-
-    OptixDeviceContextOptions options = {};
-    options.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL; // ← add this
-    options.logCallbackFunction = [](unsigned int level, const char *tag,
-                                     const char *message, void *)
-    {
-        std::cerr << "[OptiX][" << tag << "] " << message << "\n";
-    };
-    options.logCallbackLevel = 4; // verbose
-
-    OPTIX_CHECK(optixDeviceContextCreate(0, &options, &state.context));
+    OptixDeviceContextOptions opt = {};
+    opt.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+    opt.logCallbackFunction = [](unsigned int, const char*, const char* msg, void*) { std::cerr << "[OptiX] " << msg << "\n"; };
+    opt.logCallbackLevel = 4;
+    OPTIX_CHECK(optixDeviceContextCreate(0, &opt, &state.context));
 }
 
-void buildMeshAccel(RendererState& state) {
-    const uint32_t MAT_COUNT = (uint32_t)std::max(1u, state.num_materials);
-    std::vector<uint32_t> triangle_flags(MAT_COUNT, OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT);
-
-    // Upload SBT offset buffer
-    CUdeviceptr d_sbt_offsets;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_sbt_offsets),
-                          state.sbt_offsets.size() * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_sbt_offsets),
-                          state.sbt_offsets.data(),
-                          state.sbt_offsets.size() * sizeof(uint32_t),
-                          cudaMemcpyHostToDevice));
-
-    OptixBuildInput triangle_input = {};
-    triangle_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-    triangle_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-    triangle_input.triangleArray.vertexStrideInBytes = sizeof(float3);
-    triangle_input.triangleArray.numVertices = state.num_vertices;
-    triangle_input.triangleArray.vertexBuffers = &state.d_vertices;
-    triangle_input.triangleArray.flags = triangle_flags.data();
-    triangle_input.triangleArray.numSbtRecords = MAT_COUNT;
-    triangle_input.triangleArray.sbtIndexOffsetBuffer = d_sbt_offsets;
-    triangle_input.triangleArray.sbtIndexOffsetSizeInBytes = sizeof(uint32_t);
-    triangle_input.triangleArray.sbtIndexOffsetStrideInBytes = sizeof(uint32_t);
-
-    // Ask OptiX how much memory is needed
-    OptixAccelBuildOptions accel_options = {};
-    accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
-    accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
-
-    OptixAccelBufferSizes sizes;
-    optixAccelComputeMemoryUsage(
-        state.context, &accel_options,
-        &triangle_input, 1, // 1 build input
-        &sizes
-    );
-
-    // Allocate memory and build the BVH
-    CUdeviceptr d_temp;
-    cudaMalloc(reinterpret_cast<void **>(&d_temp), sizes.tempSizeInBytes);
-
-    CUdeviceptr d_output;
-    size_t compacted_size_offset = sizes.outputSizeInBytes;
-    cudaMalloc(reinterpret_cast<void **>(&d_output),
-               compacted_size_offset + 8); // +8 bytes to store the compacted size
-
-    OptixAccelEmitDesc emit_desc = {};
-    emit_desc.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
-    emit_desc.result = d_output + compacted_size_offset;
-
-    optixAccelBuild(
-        state.context, 0,
-        &accel_options,
-        &triangle_input, 1,
-        d_temp, sizes.tempSizeInBytes,
-        d_output, sizes.outputSizeInBytes,
-        &state.gas_handle,
-        &emit_desc, 1
-    );
-
-    cudaFree(reinterpret_cast<void *>(d_temp)); // temp buffer no longer needed
-
-    // Compact (shrink) the BVH
-    size_t compacted_size;
-    cudaMemcpy(
-        &compacted_size,
-        reinterpret_cast<void *>(emit_desc.result),
-        sizeof(size_t), cudaMemcpyDeviceToHost
-    );
-
-    if (compacted_size < sizes.outputSizeInBytes) {
-        cudaMalloc(reinterpret_cast<void **>(&state.d_gas_output_buffer), compacted_size);
-        optixAccelCompact(state.context, 0,
-                          state.gas_handle,
-                          state.d_gas_output_buffer,
-                          compacted_size,
-                          &state.gas_handle);
-        cudaFree(reinterpret_cast<void *>(d_output));
-    } else {
-        state.d_gas_output_buffer = d_output;
-    }
-
-    CUDA_CHECK(cudaFree(reinterpret_cast<void *>(d_sbt_offsets))); // no longer needed
-}
-
-void createModule(RendererState& state) {
-    // Options for compiling the module
-    OptixModuleCompileOptions module_compile_options = {};
-    module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
-
-    // Pipeline-wide options
-    state.pipeline_compile_options = {};
-    state.pipeline_compile_options.usesMotionBlur = false;
-    state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    state.pipeline_compile_options.numPayloadValues = 13; // data carried by each ray
-    state.pipeline_compile_options.numAttributeValues = 2; // data carried from intersection
-    state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params"; // matches device code
-
-    state.pipeline_compile_options.usesPrimitiveTypeFlags =
-        static_cast<unsigned int>(OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE);
-    state.pipeline_compile_options.allowOpacityMicromaps = 0;
-
-    // Load the compiled GPU binary (PTX) from disk
-    std::ifstream ptx_file("device.ptx", std::ios::binary);
-    std::string ptx_code(
-        (std::istreambuf_iterator<char>(ptx_file)),
-        std::istreambuf_iterator<char>()
-    );
-
-    // Create the module
-    char log[2048];
-    size_t log_size = sizeof(log);
-    optixModuleCreate(
-        state.context,
-        &module_compile_options,
-        &state.pipeline_compile_options,
-        ptx_code.c_str(),
-        ptx_code.size(),
-        log,
-        &log_size,
-        &state.ptx_module // output: the module handle
-    );
-}
-
-void createProgramGroups(RendererState& state) {
-    OptixProgramGroupOptions pg_options = {};
-    char log[2048];
-    size_t log_size = sizeof(log);
-
-    // Raygen, firing an initial ray for each pixel
-    OptixProgramGroupDesc raygen_desc = {};
-    raygen_desc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-    raygen_desc.raygen.module = state.ptx_module;
-    raygen_desc.raygen.entryFunctionName = "__raygen__rg";
-    optixProgramGroupCreate(
-        state.context,
-        &raygen_desc,
-        1, // num program groups
-        &pg_options,
-        log, &log_size,
-        &state.raygen_group
-    );
-
-    // Miss, called when a ray misses all geometry
-    OptixProgramGroupDesc miss_desc = {};
-    miss_desc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
-    miss_desc.miss.module = state.ptx_module;
-    miss_desc.miss.entryFunctionName = "__miss__ms";
-    optixProgramGroupCreate(
-        state.context,
-        &miss_desc,
-        1, // num program groups
-        &pg_options,
-        log, &log_size,
-        &state.miss_group
-    );
-
-    // Hit, called when a ray hits geometry
-    OptixProgramGroupDesc hit_desc = {};
-    hit_desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
-    hit_desc.hitgroup.moduleCH = state.ptx_module;
-    hit_desc.hitgroup.entryFunctionNameCH = "__closesthit__ch";
-    optixProgramGroupCreate(
-        state.context,
-        &hit_desc,
-        1, // num program groups
-        &pg_options,
-        log, &log_size,
-        &state.hit_group
-    );
-}
-
-void createPipeline(RendererState& state) {
-    // Link the program groups into a pipeline
-    OptixProgramGroup groups[] = {
-        state.raygen_group,
-        state.miss_group,
-        state.hit_group
-    };
-
-    // Options for pipeline creation
-    OptixPipelineLinkOptions link_options = {};
-    link_options.maxTraceDepth = 2; // max ray bounce depth
-
-    // Log buffer for pipeline creation
-    char log[2048];
-    size_t log_size = sizeof(log);
-
-    OPTIX_CHECK( optixPipelineCreate(state.context,
-                                    &state.pipeline_compile_options,
-                                    &link_options,
-                                    groups,
-                                    3,
-                                    log,
-                                    &log_size,
-                                    &state.pipeline)
-    );
-
-    // Required: set stack sizes or optixLaunch will fail with "Invalid value"
-    OPTIX_CHECK( optixPipelineSetStackSize(
-        state.pipeline,
-        2048,   // direct callable stack size from traversal
-        2048,   // direct callable stack size from state
-        2048,   // continuation callable stack size
-        1       // max traversable graph depth (1 = single GAS, no instancing)
-    ) );
-}
-
-// One SBT record bundles a shader header + optional user data
-template <typename T>
-struct SbtRecord
+void buildMeshAccel(RendererState& state)
 {
-    __align__(OPTIX_SBT_RECORD_ALIGNMENT) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
+    const uint32_t MC = std::max(1u, state.numMaterials);
+    std::vector<uint32_t> flags(MC, OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT);
+    CUdeviceptr dSbt;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dSbt), state.sbtOffsets.size() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dSbt), state.sbtOffsets.data(), state.sbtOffsets.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    OptixBuildInput ti = {};
+    ti.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+    ti.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+    ti.triangleArray.vertexStrideInBytes = sizeof(float3);
+    ti.triangleArray.numVertices = state.numVertices;
+    ti.triangleArray.vertexBuffers = &state.dVertices;
+    ti.triangleArray.flags = flags.data();
+    ti.triangleArray.numSbtRecords = MC;
+    ti.triangleArray.sbtIndexOffsetBuffer = dSbt;
+    ti.triangleArray.sbtIndexOffsetSizeInBytes = sizeof(uint32_t);
+    ti.triangleArray.sbtIndexOffsetStrideInBytes = sizeof(uint32_t);
+    OptixAccelBuildOptions ao = {};
+    ao.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
+    ao.operation = OPTIX_BUILD_OPERATION_BUILD;
+    OptixAccelBufferSizes sz;
+    optixAccelComputeMemoryUsage(state.context, &ao, &ti, 1, &sz);
+    CUdeviceptr dTmp, dOut;
+    size_t cso = sz.outputSizeInBytes;
+    cudaMalloc(reinterpret_cast<void**>(&dTmp), sz.tempSizeInBytes);
+    cudaMalloc(reinterpret_cast<void**>(&dOut), cso + 8);
+    OptixAccelEmitDesc ed;
+    ed.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+    ed.result = dOut + cso;
+    optixAccelBuild(state.context, 0, &ao, &ti, 1, dTmp, sz.tempSizeInBytes, dOut, sz.outputSizeInBytes, &state.gasHandle, &ed, 1);
+    cudaFree(reinterpret_cast<void*>(dTmp));
+    size_t cs;
+    cudaMemcpy(&cs, reinterpret_cast<void*>(ed.result), sizeof(size_t), cudaMemcpyDeviceToHost);
+    if (cs < sz.outputSizeInBytes) {
+        cudaMalloc(reinterpret_cast<void**>(&state.dGasOutputBuffer), cs);
+        optixAccelCompact(state.context, 0, state.gasHandle, state.dGasOutputBuffer, cs, &state.gasHandle);
+        cudaFree(reinterpret_cast<void*>(dOut));
+    } else {
+        state.dGasOutputBuffer = dOut;
+    }
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dSbt)));
+}
+
+void createModule(RendererState& state)
+{
+    OptixModuleCompileOptions mco = {};
+    mco.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+    mco.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
+    state.pipelineCompileOptions = {};
+    state.pipelineCompileOptions.usesMotionBlur = false;
+    state.pipelineCompileOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
+    state.pipelineCompileOptions.numPayloadValues = 13;
+    state.pipelineCompileOptions.numAttributeValues = 2;
+    state.pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";
+    state.pipelineCompileOptions.usesPrimitiveTypeFlags = (unsigned int)OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
+    state.pipelineCompileOptions.allowOpacityMicromaps = 0;
+    std::ifstream f("device.ptx", std::ios::binary);
+    std::string ptx(std::istreambuf_iterator<char>(f), {});
+    char log[2048];
+    size_t ls = sizeof(log);
+    OPTIX_CHECK(optixModuleCreate(state.context, &mco, &state.pipelineCompileOptions, ptx.c_str(), ptx.size(), log, &ls, &state.ptxModule));
+}
+
+void createProgramGroups(RendererState& state)
+{
+    OptixProgramGroupOptions pgo = {};
+    char log[2048];
+    size_t ls = sizeof(log);
+    OptixProgramGroupDesc rd = {};
+    rd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    rd.raygen.module = state.ptxModule;
+    rd.raygen.entryFunctionName = "__raygen__rg";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &rd, 1, &pgo, log, &ls, &state.raygenGroup));
+    OptixProgramGroupDesc md = {};
+    md.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    md.miss.module = state.ptxModule;
+    md.miss.entryFunctionName = "__miss__ms";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &md, 1, &pgo, log, &ls, &state.missGroup));
+    OptixProgramGroupDesc hd = {};
+    hd.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hd.hitgroup.moduleCH = state.ptxModule;
+    hd.hitgroup.entryFunctionNameCH = "__closesthit__ch";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &hd, 1, &pgo, log, &ls, &state.hitGroup));
+}
+
+void createPipeline(RendererState& state)
+{
+    OptixProgramGroup groups[] = { state.raygenGroup, state.missGroup, state.hitGroup };
+    OptixPipelineLinkOptions lo = {};
+    lo.maxTraceDepth = 2;
+    char log[2048];
+    size_t ls = sizeof(log);
+    OPTIX_CHECK(optixPipelineCreate(state.context, &state.pipelineCompileOptions, &lo, groups, 3, log, &ls, &state.pipeline));
+    OPTIX_CHECK(optixPipelineSetStackSize(state.pipeline, 2048, 2048, 2048, 1));
+}
+
+template <typename T>
+struct SbtRecord {
+    alignas(OPTIX_SBT_RECORD_ALIGNMENT) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
     T data;
 };
-
-struct RayGenData
-{
-}; // no extra data needed yet
-struct MissData
-{
-    float3 bg_color;
+struct RayGenData { };
+struct MissData {
+    float3 bgColor;
 };
-struct HitData
-{
-    float3 albedo;   // diffuse color of the surface
-    float3 emission; // for emissive/light surfaces
+struct HitData {
+    float3 albedo;
+    float3 emission;
 };
+inline size_t roundUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
-// Helper to round up to alignment
-inline size_t roundUp(size_t val, size_t align)
+void createSBT(RendererState& state)
 {
-    return ((val + align - 1) / align) * align;
-}
-
-void createSBT(RendererState &state) {
-    state.sbt = {}; // zero everything including callablesRecordBase
-
-    // Raygen record
-    SbtRecord<RayGenData> rg_record = {};
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.raygen_group, &rg_record));
-    CUdeviceptr d_rg_record;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg_record), sizeof(rg_record)));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg_record), &rg_record,
-                          sizeof(rg_record), cudaMemcpyHostToDevice));
-    state.sbt.raygenRecord = d_rg_record;   
-
-    // Miss record — set data BEFORE copying to GPU
-    SbtRecord<MissData> ms_record = {};
-    ms_record.data.bg_color = make_float3(1.f, 1.f, 1.f); // white background
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.miss_group, &ms_record));
-    CUdeviceptr d_ms_record;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_ms_record), sizeof(ms_record)));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_ms_record), &ms_record,
-                          sizeof(ms_record), cudaMemcpyHostToDevice));
-    state.sbt.missRecordBase = d_ms_record;
-    state.sbt.missRecordStrideInBytes = (unsigned int)roundUp(sizeof(ms_record), OPTIX_SBT_RECORD_ALIGNMENT);
+    state.sbt = {};
+    SbtRecord<RayGenData> rg;
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.raygenGroup, &rg));
+    CUdeviceptr drg;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&drg), sizeof(rg)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(drg), &rg, sizeof(rg), cudaMemcpyHostToDevice));
+    state.sbt.raygenRecord = drg;
+    SbtRecord<MissData> ms;
+    ms.data.bgColor = make_float3(1, 1, 1);
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.missGroup, &ms));
+    CUdeviceptr dms;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dms), sizeof(ms)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dms), &ms, sizeof(ms), cudaMemcpyHostToDevice));
+    state.sbt.missRecordBase = dms;
+    state.sbt.missRecordStrideInBytes = (unsigned int)roundUp(sizeof(ms), OPTIX_SBT_RECORD_ALIGNMENT);
     state.sbt.missRecordCount = 1;
-
-    // Hit record — set data BEFORE copying to GPU
-    const uint32_t MAT_COUNT = std::max(1u, state.num_materials);
-    std::vector<SbtRecord<HitData>> hit_records(MAT_COUNT);
-
-    for (uint32_t i = 0; i < MAT_COUNT; ++i)
-    {
-        OPTIX_CHECK(optixSbtRecordPackHeader(state.hit_group, &hit_records[i]));
-        hit_records[i].data.albedo = state.host_materials[i].albedo;
-        hit_records[i].data.emission = state.host_materials[i].emission;
+    const uint32_t MC = std::max(1u, state.numMaterials);
+    std::vector<SbtRecord<HitData>> hrs(MC);
+    for (uint32_t i = 0; i < MC; ++i) {
+        OPTIX_CHECK(optixSbtRecordPackHeader(state.hitGroup, &hrs[i]));
+        hrs[i].data.albedo = state.hostMaterials[i].albedo;
+        hrs[i].data.emission = state.hostMaterials[i].emission;
     }
-
-    size_t hit_bytes = MAT_COUNT * sizeof(SbtRecord<HitData>);
-    CUdeviceptr d_hit_records;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_hit_records), hit_bytes));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_hit_records),
-                          hit_records.data(), hit_bytes, cudaMemcpyHostToDevice));
-
-    state.sbt.hitgroupRecordBase = d_hit_records;
-    state.sbt.hitgroupRecordStrideInBytes = (unsigned int)roundUp(sizeof(SbtRecord<HitData>),
-                                                                  OPTIX_SBT_RECORD_ALIGNMENT);
-    state.sbt.hitgroupRecordCount = MAT_COUNT;
-
-    // No callables for now
+    size_t hb = MC * sizeof(SbtRecord<HitData>);
+    CUdeviceptr dhr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dhr), hb));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dhr), hrs.data(), hb, cudaMemcpyHostToDevice));
+    state.sbt.hitgroupRecordBase = dhr;
+    state.sbt.hitgroupRecordStrideInBytes = (unsigned int)roundUp(sizeof(SbtRecord<HitData>), OPTIX_SBT_RECORD_ALIGNMENT);
+    state.sbt.hitgroupRecordCount = MC;
     state.sbt.callablesRecordBase = 0;
     state.sbt.callablesRecordStrideInBytes = 0;
     state.sbt.callablesRecordCount = 0;
-
-    std::cout << "sizeof RayGenRecord: " << sizeof(SbtRecord<RayGenData>) << "\n";
-    std::cout << "sizeof MissRecord:   " << sizeof(SbtRecord<MissData>) << "\n";
-    std::cout << "sizeof HitRecord:    " << sizeof(SbtRecord<HitData>) << "\n";
-    std::cout << "OPTIX_SBT_RECORD_ALIGNMENT: " << OPTIX_SBT_RECORD_ALIGNMENT << "\n";
-    std::cout << "OPTIX_SBT_RECORD_HEADER_SIZE: " << OPTIX_SBT_RECORD_HEADER_SIZE << "\n";
 }
 
-void launch(RendererState &state)
+// ── OpenGL fullscreen quad ────────────────────────────────────────────────────
+static GLuint gQuadVAO = 0, gQuadVBO = 0, gQuadProg = 0;
+
+static void initQuad()
 {
-    const int W = 512, H = 512;
-    CUstream stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    const char* vs = "#version 330 core\n"
+                     "layout(location=0) in vec2 pos;\n"
+                     "out vec2 uv;\n"
+                     "void main(){ uv=pos*0.5+0.5; gl_Position=vec4(pos,0,1); }\n";
+    const char* fs = "#version 330 core\n"
+                     "in vec2 uv; out vec4 col; uniform sampler2D tex;\n"
+                     "void main(){ col=texture(tex,vec2(uv.x,1.0-uv.y)); }\n";
+    auto compile = [](GLenum t, const char* src) {
+        GLuint s = glCreateShader(t);
+        glShaderSource(s, 1, &src, nullptr);
+        glCompileShader(s);
+        GLint ok;
+        glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char buf[512];
+            glGetShaderInfoLog(s, 512, nullptr, buf);
+            std::cerr << "Shader err: " << buf << "\n";
+            exit(1);
+        }
+        return s;
+    };
+    GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+    gQuadProg = glCreateProgram();
+    glAttachShader(gQuadProg, v);
+    glAttachShader(gQuadProg, f);
+    glLinkProgram(gQuadProg);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    float quad[] = { -1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1 };
+    glGenVertexArrays(1, &gQuadVAO);
+    glGenBuffers(1, &gQuadVBO);
+    glBindVertexArray(gQuadVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, gQuadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glBindVertexArray(0);
+}
 
-    CUdeviceptr d_fb, d_accum;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_fb), W * H * sizeof(uchar4)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_accum), W * H * sizeof(float3)));
-    CUDA_CHECK(cudaMemset(reinterpret_cast<void *>(d_accum), 0, W * H * sizeof(float3)));
+static void drawQuad(GLuint tex)
+{
+    glUseProgram(gQuadProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(glGetUniformLocation(gQuadProg, "tex"), 0);
+    glBindVertexArray(gQuadVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+}
 
+// ── Camera input ─────────────────────────────────────────────────────────────
+static double gLastX = 0, gLastY = 0;
+static float gYaw = -90.f, gPitch = 0.f; // degrees
+static bool gFirstMouse = true;
+static bool gCameraChanged = true;
+
+static void rebuildCameraVectors(Params& p)
+{
+    float yawR = gYaw * (float)M_PI / 180.f;
+    float pitchR = gPitch * (float)M_PI / 180.f;
+    float3 fwd = normalize(make_float3(cosf(pitchR) * cosf(yawR),
+        sinf(pitchR),
+        cosf(pitchR) * sinf(yawR)));
+    float3 worldUp = make_float3(0, 1, 0);
+    float3 right = normalize(cross(fwd, worldUp));
+    float3 up = normalize(cross(right, fwd));
+    p.cam_w = fwd;
+    p.cam_u = right;
+    p.cam_v = make_float3(-up.x, -up.y, -up.z); // down vector for screen-space
+}
+
+static void mouseCallback(GLFWwindow*, double xpos, double ypos)
+{
+    if (gFirstMouse) {
+        gLastX = xpos;
+        gLastY = ypos;
+        gFirstMouse = false;
+    }
+    float dx = (float)(xpos - gLastX) * 0.15f;
+    float dy = (float)(gLastY - ypos) * 0.15f;
+    gLastX = xpos;
+    gLastY = ypos;
+    gYaw += dx;
+    gPitch = std::max(-89.f, std::min(89.f, gPitch + dy));
+    gCameraChanged = true;
+}
+
+static void handleKeys(GLFWwindow* win, Params& p, float speed)
+{
+    float3 fwd = p.cam_w;
+    float3 right = p.cam_u;
+    bool moved = false;
+    if (glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS) {
+        p.cam_eye += speed * fwd;
+        moved = true;
+    }
+    if (glfwGetKey(win, GLFW_KEY_S) == GLFW_PRESS) {
+        p.cam_eye -= speed * fwd;
+        moved = true;
+    }
+    if (glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS) {
+        p.cam_eye -= speed * right;
+        moved = true;
+    }
+    if (glfwGetKey(win, GLFW_KEY_D) == GLFW_PRESS) {
+        p.cam_eye += speed * right;
+        moved = true;
+    }
+    if (glfwGetKey(win, GLFW_KEY_Q) == GLFW_PRESS) {
+        p.cam_eye.y -= speed;
+        moved = true;
+    }
+    if (glfwGetKey(win, GLFW_KEY_E) == GLFW_PRESS) {
+        p.cam_eye.y += speed;
+        moved = true;
+    }
+    if (moved)
+        gCameraChanged = true;
+}
+
+// ── Main launch / render loop ─────────────────────────────────────────────────
+GLFWwindow* initGL()
+{
+    if (!glfwInit()) {
+        std::cerr << "GLFW init failed\n";
+        exit(1);
+    }
+    // Force discrete NVIDIA GPU on Optimus laptops.
+    // Without this GLFW picks the Intel iGPU and CUDA-GL interop fails.
+#ifdef _GLFW_X11
+    // Works on X11; on Wayland use __NV_PRIME_RENDER_OFFLOAD=1 env var instead
+#endif
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    GLFWwindow* window = glfwCreateWindow(800, 600, "OptiX Renderer", nullptr, nullptr);
+    if (!window) {
+        std::cerr << "GLFW window failed\n";
+        exit(1);
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetCursorPosCallback(window, mouseCallback);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glewExperimental = GL_TRUE;
+    GLenum glewErr = glewInit();
+    if (glewErr != GLEW_OK) {
+        std::cerr << "GLEW init failed: " << glewGetErrorString(glewErr) << "\n";
+        exit(1);
+    }
+    return window;
+}
+
+void launch(RendererState& state, GLFWwindow* window)
+{
+    const int W = 800, H = 600;
+
+    initQuad();
+
+    // ── PBO + CUDA interop ───────────────────────────────────────────────────
+    GLuint pbo = 0;
+    glGenBuffers(1, &pbo);
+    if (pbo == 0) {
+        std::cerr << "glGenBuffers failed\n";
+        exit(1);
+    }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, W * H * sizeof(uchar4), nullptr, GL_STREAM_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    cudaGraphicsResource* cudaPBO;
+    CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cudaPBO, pbo, cudaGraphicsMapFlagsWriteDiscard));
+
+    GLuint displayTex;
+    glGenTextures(1, &displayTex);
+    glBindTexture(GL_TEXTURE_2D, displayTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // ── Accumulation buffer ──────────────────────────────────────────────────
+    CUdeviceptr dAccum;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dAccum), W * H * sizeof(float3)));
+    CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
+
+    // ── Params ───────────────────────────────────────────────────────────────
     Params p = {};
-    p.frame_buffer = reinterpret_cast<uchar4 *>(d_fb);
-    p.accum_buffer = reinterpret_cast<float3 *>(d_accum);
+    p.accum_buffer = reinterpret_cast<float3*>(dAccum);
     p.width = W;
     p.height = H;
-    p.handle = state.gas_handle;
-    p.triangles = reinterpret_cast<Triangle *>(state.d_triangles);
-    p.materials = reinterpret_cast<Material *>(state.d_materials);
-
-    // Simple camera looking at the triangle (at Z=0) from Z=-2
-    p.cam_eye = make_float3(0.f, 12.5f, -30.f); 
-    p.cam_w = make_float3(0.f, 0.f, 1.f);
-    p.cam_u = make_float3(1.f, 0.f, 0.f);
-    p.cam_v = make_float3(0.f, -1.f, 0.f);
-
-    p.samples_per_pixel = 64;
+    p.handle = state.gasHandle;
+    p.triangles = reinterpret_cast<Triangle*>(state.dTriangles);
+    p.materials = reinterpret_cast<Material*>(state.dMaterials);
+    p.cam_eye = make_float3(-0.49f, 1.5f, -17.0f);
+    gYaw = -90.f;
+    gPitch = 0.f;
+    rebuildCameraVectors(p);
+    p.samples_per_pixel = 2;
     p.max_depth = 8;
     p.frame_index = 0;
 
-    CUdeviceptr d_p;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_p), sizeof(p)));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_p), &p, sizeof(p), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dParams), sizeof(Params)));
 
-    OPTIX_CHECK(optixLaunch(state.pipeline, stream, d_p, sizeof(p), &state.sbt, W, H, 1));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaGetLastError());
+    CUstream stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
 
-    std::vector<uchar4> pixels(W * H);
-    CUDA_CHECK(cudaMemcpy(pixels.data(), reinterpret_cast<void *>(d_fb),
-                          W * H * sizeof(uchar4), cudaMemcpyDeviceToHost));
+    // ── Render loop ──────────────────────────────────────────────────────────
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            break;
 
-    std::ofstream img("output.ppm");
-    img << "P3\n"
-        << W << " " << H << "\n255\n";
-    for (auto &px : pixels)
-        img << (int)px.x << " " << (int)px.y << " " << (int)px.z << "\n";
-    std::cout << "Saved output.ppm\n";
+        handleKeys(window, p, 0.3f);
+        if (gCameraChanged) {
+            rebuildCameraVectors(p);
+            p.frame_index = 0;
+            CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
+            gCameraChanged = false;
+        }
+
+        // Map PBO -> CUDA pointer
+        uchar4* devPtr;
+        size_t sz;
+        CUDA_CHECK(cudaGraphicsMapResources(1, &cudaPBO, stream));
+        CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devPtr), &sz, cudaPBO));
+
+        p.frame_buffer = devPtr;
+        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams), &p, sizeof(p), cudaMemcpyHostToDevice, stream));
+        OPTIX_CHECK(optixLaunch(state.pipeline, stream, state.dParams, sizeof(Params), &state.sbt, W, H, 1));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaPBO, stream));
+
+        p.frame_index++;
+
+        // PBO -> texture -> screen
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        glBindTexture(GL_TEXTURE_2D, displayTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        drawQuad(displayTex);
+        glfwSwapBuffers(window);
+    }
 
     cudaStreamDestroy(stream);
-    cudaFree(reinterpret_cast<void *>(d_fb));
-    cudaFree(reinterpret_cast<void *>(d_accum));
-    cudaFree(reinterpret_cast<void *>(d_p));
+    cudaFree(reinterpret_cast<void*>(dAccum));
+    cudaFree(reinterpret_cast<void*>(state.dParams));
+    cudaGraphicsUnregisterResource(cudaPBO);
+    glDeleteBuffers(1, &pbo);
+    glDeleteTextures(1, &displayTex);
+    glfwDestroyWindow(window);
+    glfwTerminate();
 }
 
-int main() {
-    RendererState state = {};
-
+// ── main ─────────────────────────────────────────────────────────────────────
+int main(int argc, char** argv)
+{
+    std::string sceneFile = (argc > 1) ? argv[1] : "scene.gltf";
+    RendererState state;
     Scene scene;
-
-    loadScene("lowpoly_tree", scene);
-    std::cout << "Materials loaded: " << scene.materials.size() << "\n";
-    for (size_t i = 0; i < scene.materials.size(); ++i)
-        std::cout << "  mat[" << i << "] albedo=("
-                  << scene.materials[i].albedo.x << ", "
-                  << scene.materials[i].albedo.y << ", "
-                  << scene.materials[i].albedo.z << ")\n";
-
-    uploadBuffersToGPU(state, scene);
-
+    loadScene(sceneFile, scene);
+    std::cout << "Materials: " << scene.materials.size() << "\n";
+    // GL context must exist BEFORE CUDA initialises the device (cudaFree(0))
+    // so that CUDA-GL interop works (cudaGraphicsGLRegisterBuffer).
+    GLFWwindow* window = initGL();
     createContext(state);
-    std::cout << "Context created." << std::endl;
-
+    std::cout << "Context created.\n";
+    uploadBuffersToGPU(state, scene);
     buildMeshAccel(state);
-    std::cout << "BVH built." << std::endl;
-
+    std::cout << "BVH built.\n";
     createModule(state);
-    std::cout << "Module created." << std::endl;
-
+    std::cout << "Module created.\n";
     createProgramGroups(state);
-    std::cout << "Program groups created." << std::endl;
-
+    std::cout << "Program groups created.\n";
     createPipeline(state);
-    std::cout << "Pipeline created." << std::endl;
-
+    std::cout << "Pipeline created.\n";
     createSBT(state);
-    std::cout << "SBT created." << std::endl;
-
-    // Validate everything before launch
-    std::cout << "pipeline: " << state.pipeline << "\n";
-    std::cout << "gas_handle: " << state.gas_handle << "\n";
-    std::cout << "raygen SBT: " << state.sbt.raygenRecord << "\n";
-    std::cout << "miss SBT: " << state.sbt.missRecordBase << "\n";
-    std::cout << "hit SBT: " << state.sbt.hitgroupRecordBase << "\n";
-    std::cout << "miss stride: " << state.sbt.missRecordStrideInBytes << "\n";
-    std::cout << "hit stride: " << state.sbt.hitgroupRecordStrideInBytes << "\n";
-    std::cout << "d_params: " << state.d_params << "\n";
-    
-    launch(state);
-
+    std::cout << "SBT created.\n";
+    launch(state, window);
     return 0;
 }

@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/home/mestay/renderer/build",
+  "command": "/usr/local/cuda-12.8/bin/nvcc -forward-unknown-to-host-compiler -I/home/mestay/optix/include -I/home/mestay/renderer/src -g -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\" -x cu -ptx /home/mestay/renderer/src/device.cu -o CMakeFiles/device_ptx.dir/src/device.ptx",
+  "file": "/home/mestay/renderer/src/device.cu",
+  "output": "CMakeFiles/device_ptx.dir/src/device.ptx"
+},
+{
+  "directory": "/home/mestay/renderer/build",
+  "command": "/usr/bin/g++ -I/home/mestay/optix/include -I/home/mestay/renderer/src -I/home/mestay/renderer/include -isystem /usr/local/cuda-12.8/targets/x86_64-linux/include -g -o CMakeFiles/renderer.dir/src/main.cpp.o -c /home/mestay/renderer/src/main.cpp",
+  "file": "/home/mestay/renderer/src/main.cpp",
+  "output": "CMakeFiles/renderer.dir/src/main.cpp.o"
+}
+]

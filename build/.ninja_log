@@ -1,0 +1,4 @@
+# ninja log v5
+1	410	1778502194042439254	CMakeFiles/device_ptx.dir/src/device.ptx	519d202abaf93296
+1	4433	1778502198060750081	CMakeFiles/renderer.dir/src/main.cpp.o	767df29f2ebd05d5
+4433	4531	1778502198160779518	renderer	daffb6577028a52c

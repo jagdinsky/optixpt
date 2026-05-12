@@ -74,7 +74,7 @@ CMakeFiles/device_ptx.dir/src/device.ptx: CMakeFiles/device_ptx.dir/includes_CUD
 CMakeFiles/device_ptx.dir/src/device.ptx: /home/mestay/renderer/src/device.cu
 CMakeFiles/device_ptx.dir/src/device.ptx: CMakeFiles/device_ptx.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/mestay/renderer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CUDA object CMakeFiles/device_ptx.dir/src/device.ptx"
-	/usr/local/cuda-12.5/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/device_ptx.dir/src/device.ptx -MF CMakeFiles/device_ptx.dir/src/device.ptx.d -x cu -ptx /home/mestay/renderer/src/device.cu -o CMakeFiles/device_ptx.dir/src/device.ptx
+	/usr/local/cuda-12.8/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/device_ptx.dir/src/device.ptx -MF CMakeFiles/device_ptx.dir/src/device.ptx.d -x cu -ptx /home/mestay/renderer/src/device.cu -o CMakeFiles/device_ptx.dir/src/device.ptx
 
 CMakeFiles/device_ptx.dir/src/device.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CUDA source to CMakeFiles/device_ptx.dir/src/device.i"
