@@ -6,7 +6,7 @@
 			[
 				{
 					"build" : ".",
-					"jsonFile" : "directory-.-Debug-f5ebdc15457944623624.json",
+					"jsonFile" : "directory-.-Release-f5ebdc15457944623624.json",
 					"minimumCMakeVersion" : 
 					{
 						"string" : "3.18"
@@ -20,7 +20,7 @@
 					]
 				}
 			],
-			"name" : "Debug",
+			"name" : "Release",
 			"projects" : 
 			[
 				{
@@ -41,14 +41,14 @@
 				{
 					"directoryIndex" : 0,
 					"id" : "device_ptx::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-device_ptx-Debug-b2897ddda3e24800620a.json",
+					"jsonFile" : "target-device_ptx-Release-8f482153db71f7899fdc.json",
 					"name" : "device_ptx",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "renderer::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-renderer-Debug-1e0edcdbd8b3a7d8c145.json",
+					"jsonFile" : "target-renderer-Release-7b2f049a8a19c0b5bdfc.json",
 					"name" : "renderer",
 					"projectIndex" : 0
 				}

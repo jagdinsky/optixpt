@@ -2,7 +2,7 @@
 	"artifacts" : 
 	[
 		{
-			"path" : "CMakeFiles/device_ptx.dir/./src/device.ptx"
+			"path" : "CMakeFiles/device_ptx.dir/src/device.ptx"
 		}
 	],
 	"backtrace" : 1,
@@ -42,7 +42,7 @@
 			"compileCommandFragments" : 
 			[
 				{
-					"fragment" : "-g -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\""
+					"fragment" : "-O3 -DNDEBUG -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\""
 				}
 			],
 			"includes" : 
