@@ -1,3 +1,5 @@
+// Use "P" button for switching between Path Tracing and Photon Mapping
+
 // build directory
 cd build
 
