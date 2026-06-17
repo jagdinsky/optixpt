@@ -1,50 +1,68 @@
 #pragma once
-#include <optix.h>
 #include <cuda_runtime.h>
+#include <optix.h>
 #include <vector_types.h>
 
-// ── Triangle ──────────────────────────────────────────────────────────────────
-// Added: uv0/uv1/uv2 — per-vertex texture coordinates read from TEXCOORD_0.
-// When a primitive has no UV attribute all three are zero, which is harmless
-// (the device code falls back to mat.albedo/mat.emission when texObj == 0).
-
+// Triangles for scene geometry
 struct Triangle {
-    float3 v0, v1, v2;   // vertices
-    float3 n0, n1, n2;   // per-vertex normals
-    float2 uv0, uv1, uv2; // per-vertex UVs  (NEW)
-    int    mat_id;
+    float3 v0, v1, v2; // vertices
+    float3 n0, n1, n2; // per-vertex normals
+    float2 uv0, uv1, uv2; // per-vertex UVs
+    int mat_id;
 };
 
-// ── Material ──────────────────────────────────────────────────────────────────
-// Added: base_color_tex / emissive_tex — opaque 64-bit CUDA texture object
-// handles.  A value of 0 means "no texture; use the flat albedo/emission
-// float3 instead."  The handles are created on the host via
-// cudaCreateTextureObject() and stored here so the device can call
-// tex2D<float4>() directly without any indirection.
+// Material description (one per material ID)
+enum MatType : int {
+    MAT_DIFFUSE = 0,
+    MAT_MIRROR = 1,
+    MAT_GLASS = 2
+};
 
+// Material data structure
 struct Material {
-    float3 albedo;                       // flat fallback color
-    float3 emission;                     // flat fallback emission
-    cudaTextureObject_t base_color_tex;  // 0 = no texture  (NEW)
-    cudaTextureObject_t emissive_tex;    // 0 = no texture  (NEW)
+    int matType = MAT_DIFFUSE; // 0 = diffuse, 1 = mirror, 2 = glass
+    float3 albedo;
+    float3 emission;
+    float ior = 1.5f; // for glass: index of refraction
+    cudaTextureObject_t base_color_tex; // 0 = no texture
+    cudaTextureObject_t emissive_tex; // 0 = no texture
+};
+
+// Emissive light descriptor (one per emissive triangle)
+// Built on the host, uploaded to params.lights / params.num_lights.
+// area = |cross(e1,e2)| / 2  (precomputed for sampling efficiency)
+struct EmissiveTriangle {
+    float3 v0, v1, v2; // world-space vertices (duplicated for fast access)
+    float3 emission; // emitted radiance (already resolved from material)
+    float area; // triangle area
+    int tri_idx; // index into params.triangles (for normal lookup)
+};
+
+// Photon data structure
+struct Photon {
+    float3 pos; // world-space position
+    float3 power; // Φ = power = radiance * area (for surface photons) or radiance (for volume photons)
+    float3 dir; // world-space incident direction (pointing towards the surface for surface photons)
+    // 12+12+12 = 36 byte -> 48 with alignment for coalesced access
+    float _pad;
 };
 
 // ── Params ────────────────────────────────────────────────────────────────────
-
 struct Params {
     // Output buffers
-    uchar4* frame_buffer;   // final 8-bit RGBA image written each frame
-    float3* accum_buffer;   // HDR running sum for progressive accumulation
+    uchar4* frame_buffer;
+    float3* accum_buffer;
 
+    // Scene data (device pointers)
     unsigned width;
     unsigned height;
     OptixTraversableHandle handle;
 
     // Camera
     float3 cam_eye;
-    float3 cam_u;   // right  (pre-scaled by half image-plane width)
-    float3 cam_v;   // down   (pre-scaled by half image-plane height)
-    float3 cam_w;   // forward to image-plane centre
+    float3 cam_u; // right  (pre-scaled)
+    float3 cam_v; // down   (pre-scaled)
+    float3 cam_w; // forward to image-plane centre
 
     // Path tracing
     int samples_per_pixel;
@@ -54,4 +72,20 @@ struct Params {
     // Scene geometry
     Triangle* triangles;
     Material* materials;
+
+    // NEE: emissive light list (device pointer, built by host)
+    EmissiveTriangle* lights;
+    int num_lights;
+    float total_light_area; // sum of all light areas (for uniform sampling)
+
+    // Photon map
+    Photon* photon_map; // device pointer, size of num_photons
+    int num_photons; // number of photons sent
+    int num_stored; // number of photons stored in the map, <= num_photons (device pointer -> single int)
+    int* photon_count; // &num_stored on GPU
+    float gather_radius; // radius of gathering (initial value, can be adapted)
+    int photons_per_light; // how many photons per light source
+
+    // Render mode flag
+    int render_mode; // 0 = path tracer, 1 = photon mapping
 };
