@@ -1,0 +1,4 @@
+/home/mestay/renderer/build/CMakeFiles/device_ptx.dir
+/home/mestay/renderer/build/CMakeFiles/renderer.dir
+/home/mestay/renderer/build/CMakeFiles/edit_cache.dir
+/home/mestay/renderer/build/CMakeFiles/rebuild_cache.dir

@@ -5,7 +5,7 @@
 
 extern "C" __constant__ Params params;
 
-// float3 helpers
+// helpers
 __device__ __forceinline__ float3 operator+(float3 a, float3 b) { return make_float3(a.x + b.x, a.y + b.y, a.z + b.z); }
 __device__ __forceinline__ float3 operator-(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
 __device__ __forceinline__ float3 operator*(float t, float3 v) { return make_float3(t * v.x, t * v.y, t * v.z); }
@@ -28,6 +28,110 @@ __device__ __forceinline__ float3 normalize(float3 v)
     return make_float3(v.x * inv, v.y * inv, v.z * inv);
 }
 __device__ __forceinline__ float length(float3 v) { return sqrtf(dot(v, v)); }
+
+__device__ __forceinline__ float srgbToLinear(float c)
+{
+    return (c <= 0.04045f) ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+__device__ __forceinline__ float3 sampleTexSRGB(cudaTextureObject_t tex,
+    float u, float v,
+    float3 fallback)
+{
+    if (tex == 0)
+        return fallback;
+    float4 s = tex2D<float4>(tex, u, v);
+    return make_float3(srgbToLinear(s.x),
+        srgbToLinear(s.y),
+        srgbToLinear(s.z));
+}
+
+// grid cell lookup
+__device__ __forceinline__ int gridCellFlat(const PhotonGrid& g, float3 p)
+{
+    int ix = (int)floorf((p.x - g.aabb_min.x) / g.cell_size);
+    int iy = (int)floorf((p.y - g.aabb_min.y) / g.cell_size);
+    int iz = (int)floorf((p.z - g.aabb_min.z) / g.cell_size);
+    // clamp to valid range
+    ix = max(0, min(ix, g.dims.x - 1));
+    iy = max(0, min(iy, g.dims.y - 1));
+    iz = max(0, min(iz, g.dims.z - 1));
+    return iz * g.dims.y * g.dims.x + iy * g.dims.x + ix;
+}
+__device__ float3 gatherPhotonsGrid(float3 hitpos, float3 n,
+    float r, float r2)
+{
+    const PhotonGrid& g = params.grid;
+    float3 irradiance = make_float3(0.f, 0.f, 0.f);
+
+    // hitpos in grid coordinates
+    int cx = (int)floorf((hitpos.x - g.aabb_min.x) / g.cell_size);
+    int cy = (int)floorf((hitpos.y - g.aabb_min.y) / g.cell_size);
+    int cz = (int)floorf((hitpos.z - g.aabb_min.z) / g.cell_size);
+
+    // go over neighboring cells (3x3x3)
+    for (int dz = -1; dz <= 1; ++dz) {
+        int nz = cz + dz;
+        if (nz < 0 || nz >= g.dims.z)
+            continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            int ny = cy + dy;
+            if (ny < 0 || ny >= g.dims.y)
+                continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = cx + dx;
+                if (nx < 0 || nx >= g.dims.x)
+                    continue;
+
+                int cell = nz * g.dims.y * g.dims.x + ny * g.dims.x + nx;
+                int start = g.cell_start[cell];
+                int count = g.cell_count[cell];
+
+                for (int k = 0; k < count; ++k) {
+                    int pid = g.grid_photon_ids[start + k];
+                    const Photon& ph = params.photon_map[pid];
+
+                    float3 diff = ph.pos - hitpos;
+                    float d2 = dot(diff, diff);
+                    if (d2 > r2)
+                        continue;
+
+                    float cosCheck = dot(n, ph.dir);
+                    if (cosCheck < 1e-3f)
+                        continue;
+
+                    float dist = sqrtf(d2);
+                    float weight = 1.f - dist / r; // cone filter k=1
+                    irradiance += weight * ph.power;
+                }
+            }
+        }
+    }
+    return irradiance;
+}
+__device__ float3 gatherBruteForce(float3 hitpos, float3 n,
+    float r, float r2)
+{
+    float3 irradiance = make_float3(0.f, 0.f, 0.f);
+    int stored = min(*params.photon_count, params.num_photons);
+
+    for (int i = 0; i < stored; i++) {
+        const Photon& ph = params.photon_map[i];
+        float3 diff = ph.pos - hitpos;
+        float d2 = dot(diff, diff);
+        if (d2 > r2)
+            continue;
+
+        float cosCheck = dot(n, ph.dir);
+        if (cosCheck < 1e-3f)
+            continue;
+
+        float dist = sqrtf(d2);
+        float weight = 1.f - dist / r;
+        irradiance += weight * ph.power;
+    }
+    return irradiance;
+}
 
 // SBT structs
 struct MissData {
@@ -268,7 +372,7 @@ extern "C" __global__ void __raygen__rg()
                 float fr = schlick(cosT, ior);
 
                 float3 newdir;
-                bool doReflect = !refractDir(dir, n, eta, newdir); // TIR?
+                bool doReflect = !refractDir(dir, n, eta, newdir); // TIR
                 if (!doReflect)
                     doReflect = (randf(rng) < fr); // stochastic Fresnel
                 if (doReflect)
@@ -331,7 +435,8 @@ extern "C" __global__ void __raygen__photon()
 
     float3 power = lt.emission * lt.area * M_PIf
         * (float)params.num_lights
-        * (1.0f / (float)params.num_photons);
+        * (1.0f / (float)params.num_photons)
+        * params.photon_power_scale;
 
     for (int depth = 0; depth < params.max_depth; depth++) {
         // Payload: same as CH layout
@@ -425,131 +530,127 @@ extern "C" __global__ void __raygen__gather()
     const int pixel = idx.y * params.width + idx.x;
     unsigned int rng = pixel * 1973u + (unsigned int)params.frame_index * 9277u + 4801u;
 
-    float pu = (idx.x + randf(rng)) / params.width;
-    float pv = (idx.y + randf(rng)) / params.height;
+    float3 result_over_samples = make_float3(0.f, 0.f, 0.f);
 
-    float3 origin = params.cam_eye;
-    float3 dir = normalize(params.cam_w
-        + (2.f * pu - 1.f) * params.cam_u
-        + (2.f * pv - 1.f) * params.cam_v);
+    for (int s = 0; s < params.samples_per_pixel; s++) {
+        float pu = (idx.x + randf(rng)) / params.width;
+        float pv = (idx.y + randf(rng)) / params.height;
 
-    float3 result = make_float3(0.f, 0.f, 0.f);
-    float3 path_throughput = make_float3(1.f, 1.f, 1.f);
+        float3 origin = params.cam_eye;
+        float3 dir = normalize(params.cam_w
+            + (2.f * pu - 1.f) * params.cam_u
+            + (2.f * pv - 1.f) * params.cam_v);
 
-    for (int depth = 0; depth < params.max_depth; depth++) {
+        float3 result = make_float3(0.f, 0.f, 0.f);
+        float3 path_throughput = make_float3(1.f, 1.f, 1.f);
 
-        // p0-p2   radiance (CH writes emission)
-        // p3-p5   albedo   (CH writes albedo of all matType)
-        // p6      bsdfPdf  (CH writes 0u, not needed for gathering)
-        // p7-p9   hitpos   (CH writes)
-        // p10-p12 normal   (CH writes, face-forward)
-        // p13     matType[7:0] | outsideFlag[8]
-        // p14     mat_id
-        // p15     done (0=hit, 1=miss)
-        unsigned int p0 = 0u, p1 = 0u, p2 = 0u;
-        unsigned int p3 = __float_as_uint(1.f); // throughput.x -> CH reads for emission MIS
-        unsigned int p4 = __float_as_uint(1.f); // throughput.y
-        unsigned int p5 = __float_as_uint(1.f); // throughput.z
-        unsigned int p6 = 0u; // nextBsdfPdf = 0 -> CH gives full emission weight
-        unsigned int p7 = 0u, p8 = 0u, p9 = 0u;
-        unsigned int p10 = 0u, p11 = 0u, p12 = 0u;
-        unsigned int p13 = 0u, p14 = 0u, p15 = 0u;
+        for (int depth = 0; depth < params.max_depth; depth++) {
 
-        optixTrace(params.handle, origin, dir,
-            1e-3f, 1e16f, 0.f,
-            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
-            0, 1, 0,
-            p0, p1, p2, p3, p4, p5,
-            p6, p7, p8, p9, p10, p11,
-            p12, p13, p14, p15);
+            // p0-p2   radiance (CH writes emission)
+            // p3-p5   albedo   (CH writes albedo of all matType)
+            // p6      bsdfPdf  (CH writes 0u, not needed for gathering)
+            // p7-p9   hitpos   (CH writes)
+            // p10-p12 normal   (CH writes, face-forward)
+            // p13     matType[7:0] | outsideFlag[8]
+            // p14     mat_id
+            // p15     done (0=hit, 1=miss)
+            unsigned int p0 = 0u, p1 = 0u, p2 = 0u;
+            unsigned int p3 = __float_as_uint(1.f); // throughput.x -> CH reads for emission MIS
+            unsigned int p4 = __float_as_uint(1.f); // throughput.y
+            unsigned int p5 = __float_as_uint(1.f); // throughput.z
+            unsigned int p6 = 0u; // nextBsdfPdf = 0 -> CH gives full emission weight
+            unsigned int p7 = 0u, p8 = 0u, p9 = 0u;
+            unsigned int p10 = 0u, p11 = 0u, p12 = 0u;
+            unsigned int p13 = 0u, p14 = 0u, p15 = 0u;
 
-        if (p15 == 1u) {
-            // Miss —> sky (CH/miss calculates sky radiance in p0-p2 with throughput=1)
-            result += path_throughput * make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
-            break;
-        }
+            optixTrace(params.handle, origin, dir,
+                1e-3f, 1e16f, 0.f,
+                OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
+                0, 1, 0,
+                p0, p1, p2, p3, p4, p5,
+                p6, p7, p8, p9, p10, p11,
+                p12, p13, p14, p15);
 
-        // Read payload
-        unsigned int matType = p13 & 0xFFu;
-        bool outsideFlag = (p13 >> 8u) & 1u;
-        unsigned int mat_id = p14;
-
-        float3 hitpos = make_float3(__uint_as_float(p7),
-            __uint_as_float(p8),
-            __uint_as_float(p9));
-        float3 n = make_float3(__uint_as_float(p10),
-            __uint_as_float(p11),
-            __uint_as_float(p12));
-        float3 albedo = make_float3(__uint_as_float(p3),
-            __uint_as_float(p4),
-            __uint_as_float(p5));
-
-        // Emission from light source (CH wrote to p0-p2 with throughput=1)
-        float3 emission = make_float3(__uint_as_float(p0),
-            __uint_as_float(p1),
-            __uint_as_float(p2));
-        result += path_throughput * emission;
-
-        if (matType == MAT_DIFFUSE) {
-            // Photon gathering (brute-force)
-            float r2 = params.gather_radius * params.gather_radius;
-            int stored = min(*params.photon_count, params.num_photons);
-
-            float3 irradiance = make_float3(0.f, 0.f, 0.f);
-            int count = 0;
-
-            for (int i = 0; i < stored; i++) {
-                const Photon& ph = params.photon_map[i];
-                float3 diff = ph.pos - hitpos;
-                float d2 = dot(diff, diff);
-                if (d2 > r2)
-                    continue;
-
-                // Cone filter k=1: w = 1 - dist/(k*r)
-                float dist = sqrtf(d2);
-                float weight = 1.f - dist / params.gather_radius;
-                irradiance += weight * ph.power;
-                count++;
+            if (p15 == 1u) {
+                // Miss —> sky (CH/miss calculates sky radiance in p0-p2 with throughput=1)
+                result += path_throughput * make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
+                break;
             }
 
-            // Normalization of the conical filter k=1: π*r²/3
-            if (count > 0) {
-                float norm = 3.f / (M_PIf * r2);
+            // Read payload
+            unsigned int matType = p13 & 0xFFu;
+            bool outsideFlag = (p13 >> 8u) & 1u;
+            unsigned int mat_id = p14;
+
+            float3 hitpos = make_float3(__uint_as_float(p7),
+                __uint_as_float(p8),
+                __uint_as_float(p9));
+            float3 n = make_float3(__uint_as_float(p10),
+                __uint_as_float(p11),
+                __uint_as_float(p12));
+            float3 albedo = make_float3(__uint_as_float(p3),
+                __uint_as_float(p4),
+                __uint_as_float(p5));
+
+            // Emission from light source (CH wrote to p0-p2 with throughput=1)
+            float3 emission = make_float3(__uint_as_float(p0),
+                __uint_as_float(p1),
+                __uint_as_float(p2));
+            result += path_throughput * emission;
+
+            if (matType == MAT_DIFFUSE) {
+                // Photon gathering (brute-force)
+                float r = params.gather_radius;
+                float r2 = params.gather_radius * params.gather_radius;
+                int stored = min(*params.photon_count, params.num_photons);
+
+                float3 irradiance = (params.use_grid)
+                    ? gatherPhotonsGrid(hitpos, n, r, r2)
+                    : gatherBruteForce(hitpos, n, r, r2);
+
+                // Normalization of the conical filter k=1: π*r^2 / 3
+                float norm = 3.0f / (M_PIf * r2);
                 irradiance = irradiance * norm;
+
+                // Lambertian BRDF
+                result += path_throughput * albedo * irradiance * M_1_PIf;
+                break; // PM: only first diffuse bounce
+
+            } else if (matType == MAT_MIRROR) {
+                path_throughput = path_throughput * albedo;
+                dir = normalize(dir - 2.f * dot(dir, n) * n);
+                origin = hitpos + 1e-3f * dir;
+
+            } else { // MAT_GLASS
+                float ior = params.materials[mat_id].ior;
+                float eta = outsideFlag ? (1.f / ior) : ior;
+                float cosT = fabsf(dot(-dir, n));
+                float fr = schlick(cosT, ior);
+                float3 newdir;
+                bool doRefl = !refractDir(dir, n, eta, newdir);
+                if (!doRefl)
+                    doRefl = (randf(rng) < fr);
+                if (doRefl)
+                    newdir = normalize(dir - 2.f * dot(dir, n) * n);
+                dir = newdir;
+                origin = hitpos + 1e-3f * dir;
             }
-
-            // Lambertian BRDF: fr = albedo/π, times π from gathering -> albedo
-            result += path_throughput * albedo * M_1_PIf * irradiance;
-            break; // PM: only first diffuse bounce
-
-        } else if (matType == MAT_MIRROR) {
-            path_throughput = path_throughput * albedo;
-            dir = normalize(dir - 2.f * dot(dir, n) * n);
-            origin = hitpos + 1e-3f * dir;
-
-        } else { // MAT_GLASS
-            float ior = params.materials[mat_id].ior;
-            float eta = outsideFlag ? (1.f / ior) : ior;
-            float cosT = fabsf(dot(-dir, n));
-            float fr = schlick(cosT, ior);
-            float3 newdir;
-            bool doRefl = !refractDir(dir, n, eta, newdir);
-            if (!doRefl)
-                doRefl = (randf(rng) < fr);
-            if (doRefl)
-                newdir = normalize(dir - 2.f * dot(dir, n) * n);
-            dir = newdir;
-            origin = hitpos + 1e-3f * dir;
         }
+
+        result_over_samples += result;
     }
+
+    result_over_samples.x /= params.samples_per_pixel;
+    result_over_samples.y /= params.samples_per_pixel;
+    result_over_samples.z /= params.samples_per_pixel;
 
     // Temporal accumulation
     float3 prev = (params.frame_index == 0)
         ? make_float3(0.f, 0.f, 0.f)
         : params.accum_buffer[pixel];
-    float3 acc = make_float3(prev.x + result.x,
-        prev.y + result.y,
-        prev.z + result.z);
+    float3 acc = make_float3(prev.x + result_over_samples.x,
+        prev.y + result_over_samples.y,
+        prev.z + result_over_samples.z);
     params.accum_buffer[pixel] = acc;
 
     float nf = float(params.frame_index + 1);
@@ -585,8 +686,8 @@ extern "C" __global__ void __closesthit__ch()
     // Resolve albedo (texture * factor or just factor)
     float3 albedo;
     if (mat.base_color_tex != 0) {
-        float4 s = tex2D<float4>(mat.base_color_tex, uvu, uvv);
-        albedo = make_float3(s.x * mat.albedo.x, s.y * mat.albedo.y, s.z * mat.albedo.z);
+        albedo = sampleTexSRGB(mat.base_color_tex, uvu, uvv, mat.albedo);
+        albedo = albedo * mat.albedo;
     } else {
         albedo = mat.albedo;
     }
