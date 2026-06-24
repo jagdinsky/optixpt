@@ -190,6 +190,10 @@ struct RendererState {
     CUdeviceptr drg_photon = 0;
     CUdeviceptr drg_gather = 0;
 
+    CUdeviceptr dGridCellStart = 0;
+    CUdeviceptr dGridCellCount = 0;
+    CUdeviceptr dGridPhotonIds = 0;
+
     uint32_t numVertices = 0;
     uint32_t numMaterials = 0;
 
@@ -839,6 +843,137 @@ static GLFWwindow* initGL()
     return w;
 }
 
+void buildPhotonGrid(Params& params,
+    CUdeviceptr& dGridCellStart,
+    CUdeviceptr& dGridCellCount,
+    CUdeviceptr& dGridPhotonIds)
+{
+    // ── 1. Скачать фотоны с GPU ──────────────────────────────────────────────
+    int storedCount = 0;
+    CUDA_CHECK(cudaMemcpy(&storedCount, params.photon_count,
+        sizeof(int), cudaMemcpyDeviceToHost));
+    storedCount = std::min(storedCount, params.num_photons);
+
+    if (storedCount == 0) {
+        params.use_grid = 0;
+        return;
+    }
+
+    std::vector<Photon> hostPhotons(storedCount);
+    CUDA_CHECK(cudaMemcpy(hostPhotons.data(), params.photon_map,
+        storedCount * sizeof(Photon),
+        cudaMemcpyDeviceToHost));
+
+    // ── 2. AABB фотонов ──────────────────────────────────────────────────────
+    float3 bmin = hostPhotons[0].pos;
+    float3 bmax = hostPhotons[0].pos;
+    for (int i = 1; i < storedCount; ++i) {
+        const float3& p = hostPhotons[i].pos;
+        bmin.x = std::min(bmin.x, p.x);
+        bmax.x = std::max(bmax.x, p.x);
+        bmin.y = std::min(bmin.y, p.y);
+        bmax.y = std::max(bmax.y, p.y);
+        bmin.z = std::min(bmin.z, p.z);
+        bmax.z = std::max(bmax.z, p.z);
+    }
+    // Отступ на 1 ячейку, чтобы граничные фотоны попали внутрь
+    float r = params.gather_radius;
+    bmin.x -= r;
+    bmin.y -= r;
+    bmin.z -= r;
+    bmax.x += r;
+    bmax.y += r;
+    bmax.z += r;
+
+    // ── 3. Размеры сетки ─────────────────────────────────────────────────────
+    int3 dims;
+    dims.x = std::max(1, (int)std::ceil((bmax.x - bmin.x) / r));
+    dims.y = std::max(1, (int)std::ceil((bmax.y - bmin.y) / r));
+    dims.z = std::max(1, (int)std::ceil((bmax.z - bmin.z) / r));
+
+    // Защита от слишком больших сцен (ограничиваем 512^3)
+    dims.x = std::min(dims.x, 512);
+    dims.y = std::min(dims.y, 512);
+    dims.z = std::min(dims.z, 512);
+
+    int totalCells = dims.x * dims.y * dims.z;
+    std::cout << "[PhotonGrid] dims = " << dims.x << "x" << dims.y << "x" << dims.z
+              << "  cells = " << totalCells
+              << "  photons = " << storedCount << "\n";
+
+    // ── 4. Подсчёт фотонов в каждой ячейке ──────────────────────────────────
+    auto cellIndex = [&](float3 pos) -> int {
+        int ix = (int)std::floor((pos.x - bmin.x) / r);
+        int iy = (int)std::floor((pos.y - bmin.y) / r);
+        int iz = (int)std::floor((pos.z - bmin.z) / r);
+        ix = std::max(0, std::min(ix, dims.x - 1));
+        iy = std::max(0, std::min(iy, dims.y - 1));
+        iz = std::max(0, std::min(iz, dims.z - 1));
+        return iz * dims.y * dims.x + iy * dims.x + ix;
+    };
+
+    std::vector<int> cellCount(totalCells, 0);
+    for (int i = 0; i < storedCount; ++i)
+        cellCount[cellIndex(hostPhotons[i].pos)]++;
+
+    // ── 5. Prefix sum → cell_start ───────────────────────────────────────────
+    std::vector<int> cellStart(totalCells, 0);
+    for (int c = 1; c < totalCells; ++c)
+        cellStart[c] = cellStart[c - 1] + cellCount[c - 1];
+
+    // ── 6. Заполнение grid_photon_ids ────────────────────────────────────────
+    std::vector<int> gridPhotonIds(storedCount);
+    std::vector<int> insertCursor(cellStart); // копия для записи
+
+    for (int i = 0; i < storedCount; ++i) {
+        int c = cellIndex(hostPhotons[i].pos);
+        gridPhotonIds[insertCursor[c]++] = i;
+    }
+
+    // ── 7. Загрузка на GPU ───────────────────────────────────────────────────
+    // Освобождаем старые буферы (если были)
+    if (dGridCellStart) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridCellStart)));
+        dGridCellStart = 0;
+    }
+    if (dGridCellCount) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridCellCount)));
+        dGridCellCount = 0;
+    }
+    if (dGridPhotonIds) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridPhotonIds)));
+        dGridPhotonIds = 0;
+    }
+
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dGridCellStart),
+        totalCells * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellStart),
+        cellStart.data(), totalCells * sizeof(int),
+        cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dGridCellCount),
+        totalCells * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellCount),
+        cellCount.data(), totalCells * sizeof(int),
+        cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dGridPhotonIds),
+        storedCount * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridPhotonIds),
+        gridPhotonIds.data(), storedCount * sizeof(int),
+        cudaMemcpyHostToDevice));
+
+    // ── 8. Записываем в params ───────────────────────────────────────────────
+    params.grid.aabb_min = bmin;
+    params.grid.aabb_max = bmax;
+    params.grid.dims = dims;
+    params.grid.cell_size = r;
+    params.grid.cell_start = reinterpret_cast<int*>(dGridCellStart);
+    params.grid.cell_count = reinterpret_cast<int*>(dGridCellCount);
+    params.grid.grid_photon_ids = reinterpret_cast<int*>(dGridPhotonIds);
+    params.use_grid = 1;
+}
+
 // main
 int main(int argc, char** argv)
 {
@@ -859,7 +994,7 @@ int main(int argc, char** argv)
     // Build emissive light list
     buildLightList(scene, state);
 
-    const int NUM_PHOTONS = 500000;
+    const int NUM_PHOTONS = 100'000'000;
     Photon* dPhotonMap;
     CUDA_CHECK(cudaMalloc(&dPhotonMap, NUM_PHOTONS * sizeof(Photon)));
     int* dPhotonCount;
@@ -869,7 +1004,8 @@ int main(int argc, char** argv)
     p.photon_map = dPhotonMap;
     p.num_photons = NUM_PHOTONS;
     p.photon_count = dPhotonCount;
-    p.gather_radius = 3.0f; // tune for the scene
+    p.gather_radius = 1.0f; // tune for the scene
+    p.photon_power_scale = 10.0f; // tune for the scene
     p.render_mode = 1;
 
     uploadSceneBuffers(scene, state);
@@ -929,6 +1065,8 @@ int main(int argc, char** argv)
 
     bool photons_valid = false;
 
+    p.render_mode = 0; // start with path tracing
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
@@ -937,8 +1075,10 @@ int main(int argc, char** argv)
         handleKeys(window, p, 4.0f);
         if (gCameraChanged) {
             rebuildCameraVectors(p);
+
             p.frame_index = 0;
             CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
+
             gCameraChanged = false;
         }
 
@@ -948,7 +1088,6 @@ int main(int argc, char** argv)
             p.render_mode = 1 - p.render_mode;
             p.frame_index = 0;
             CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
-            photons_valid = false;
         }
         pKeyWasDown = pKeyDown;
 
@@ -987,6 +1126,10 @@ int main(int argc, char** argv)
                     state.dParams, sizeof(Params),
                     &sbtPhoton,
                     p.num_photons, 1, 1)); // 1D!
+
+                buildPhotonGrid(p, state.dGridCellStart, state.dGridCellCount, state.dGridPhotonIds);
+                CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params), cudaMemcpyHostToDevice));
+
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 photons_valid = true;
             }

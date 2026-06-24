@@ -47,7 +47,19 @@ struct Photon {
     float _pad;
 };
 
-// ── Params ────────────────────────────────────────────────────────────────────
+// Uniform photon grid
+struct PhotonGrid {
+    float3 aabb_min; // world-space AABB min
+    float3 aabb_max; // world-space AABB max
+    int3 dims; // number of cells in X,Y,Z
+    float cell_size; // = gather_radius
+
+    int* cell_start; // [dims.x*dims.y*dims.z] starting range in grid_photon_ids
+    int* cell_count; // [dims.x*dims.y*dims.z] number of photons ячейке
+    int* grid_photon_ids; // [num_stored] indices into photon_map (sorted by cell)
+};
+
+// Params
 struct Params {
     // Output buffers
     uchar4* frame_buffer;
@@ -86,6 +98,13 @@ struct Params {
     float gather_radius; // radius of gathering (initial value, can be adapted)
     int photons_per_light; // how many photons per light source
 
+    // Photon grid
+    PhotonGrid grid;
+    int use_grid; // 0 = brute-force, 1 = grid lookup
+
     // Render mode flag
     int render_mode; // 0 = path tracer, 1 = photon mapping
+
+    // Photon power scaling factor (to adjust brightness)
+    float photon_power_scale;
 };
