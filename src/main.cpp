@@ -848,7 +848,7 @@ void buildPhotonGrid(Params& params,
     CUdeviceptr& dGridCellCount,
     CUdeviceptr& dGridPhotonIds)
 {
-    // ── 1. Скачать фотоны с GPU ──────────────────────────────────────────────
+    // get photon count from GPU
     int storedCount = 0;
     CUDA_CHECK(cudaMemcpy(&storedCount, params.photon_count,
         sizeof(int), cudaMemcpyDeviceToHost));
@@ -864,7 +864,7 @@ void buildPhotonGrid(Params& params,
         storedCount * sizeof(Photon),
         cudaMemcpyDeviceToHost));
 
-    // ── 2. AABB фотонов ──────────────────────────────────────────────────────
+    // AABB bounds of all photons
     float3 bmin = hostPhotons[0].pos;
     float3 bmax = hostPhotons[0].pos;
     for (int i = 1; i < storedCount; ++i) {
@@ -876,7 +876,7 @@ void buildPhotonGrid(Params& params,
         bmin.z = std::min(bmin.z, p.z);
         bmax.z = std::max(bmax.z, p.z);
     }
-    // Отступ на 1 ячейку, чтобы граничные фотоны попали внутрь
+    // one cell extra in each direction to avoid boundary issues
     float r = params.gather_radius;
     bmin.x -= r;
     bmin.y -= r;
@@ -885,23 +885,23 @@ void buildPhotonGrid(Params& params,
     bmax.y += r;
     bmax.z += r;
 
-    // ── 3. Размеры сетки ─────────────────────────────────────────────────────
+    // grid dimensions (number of cells in each direction)
     int3 dims;
     dims.x = std::max(1, (int)std::ceil((bmax.x - bmin.x) / r));
     dims.y = std::max(1, (int)std::ceil((bmax.y - bmin.y) / r));
     dims.z = std::max(1, (int)std::ceil((bmax.z - bmin.z) / r));
 
-    // Защита от слишком больших сцен (ограничиваем 512^3)
-    dims.x = std::min(dims.x, 512);
-    dims.y = std::min(dims.y, 512);
-    dims.z = std::min(dims.z, 512);
+    // limit grid size to 512^3 cells
+    dims.x = std::min(dims.x, 1024);
+    dims.y = std::min(dims.y, 1024);
+    dims.z = std::min(dims.z, 1024);
 
     int totalCells = dims.x * dims.y * dims.z;
     std::cout << "[PhotonGrid] dims = " << dims.x << "x" << dims.y << "x" << dims.z
               << "  cells = " << totalCells
               << "  photons = " << storedCount << "\n";
 
-    // ── 4. Подсчёт фотонов в каждой ячейке ──────────────────────────────────
+    // Count photons in each cell
     auto cellIndex = [&](float3 pos) -> int {
         int ix = (int)std::floor((pos.x - bmin.x) / r);
         int iy = (int)std::floor((pos.y - bmin.y) / r);
@@ -916,12 +916,12 @@ void buildPhotonGrid(Params& params,
     for (int i = 0; i < storedCount; ++i)
         cellCount[cellIndex(hostPhotons[i].pos)]++;
 
-    // ── 5. Prefix sum → cell_start ───────────────────────────────────────────
+    // Prefix sum -> cell_start
     std::vector<int> cellStart(totalCells, 0);
     for (int c = 1; c < totalCells; ++c)
         cellStart[c] = cellStart[c - 1] + cellCount[c - 1];
 
-    // ── 6. Заполнение grid_photon_ids ────────────────────────────────────────
+    // Filling grid_photon_ids
     std::vector<int> gridPhotonIds(storedCount);
     std::vector<int> insertCursor(cellStart); // копия для записи
 
@@ -930,8 +930,8 @@ void buildPhotonGrid(Params& params,
         gridPhotonIds[insertCursor[c]++] = i;
     }
 
-    // ── 7. Загрузка на GPU ───────────────────────────────────────────────────
-    // Освобождаем старые буферы (если были)
+    // Upload to GPU
+    // Free previous buffers if they exist
     if (dGridCellStart) {
         CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridCellStart)));
         dGridCellStart = 0;
@@ -963,7 +963,7 @@ void buildPhotonGrid(Params& params,
         gridPhotonIds.data(), storedCount * sizeof(int),
         cudaMemcpyHostToDevice));
 
-    // ── 8. Записываем в params ───────────────────────────────────────────────
+    // Update params
     params.grid.aabb_min = bmin;
     params.grid.aabb_max = bmax;
     params.grid.dims = dims;
