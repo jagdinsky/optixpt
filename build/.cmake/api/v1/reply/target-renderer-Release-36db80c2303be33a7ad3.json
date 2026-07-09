@@ -30,19 +30,19 @@
 			{
 				"command" : 0,
 				"file" : 0,
-				"line" : 21,
+				"line" : 41,
 				"parent" : 0
 			},
 			{
 				"command" : 1,
 				"file" : 0,
-				"line" : 30,
+				"line" : 50,
 				"parent" : 0
 			},
 			{
 				"command" : 3,
 				"file" : 0,
-				"line" : 6,
+				"line" : 5,
 				"parent" : 0
 			},
 			{
@@ -64,7 +64,7 @@
 			{
 				"command" : 5,
 				"file" : 0,
-				"line" : 23,
+				"line" : 43,
 				"parent" : 0
 			}
 		]
@@ -93,6 +93,14 @@
 					"path" : "/home/mestay/renderer/include"
 				},
 				{
+					"backtrace" : 2,
+					"path" : "/home/mestay/renderer/include/imgui"
+				},
+				{
+					"backtrace" : 2,
+					"path" : "/home/mestay/renderer/include/imgui/backends"
+				},
+				{
 					"backtrace" : 7,
 					"isSystem" : true,
 					"path" : "/usr/local/cuda-12.8/targets/x86_64-linux/include"
@@ -103,6 +111,13 @@
 			[
 				0
 			]
+		}
+	],
+	"dependencies" : 
+	[
+		{
+			"backtrace" : 2,
+			"id" : "imgui::@6890427a1f51a3e7e1df"
 		}
 	],
 	"id" : "renderer::@6890427a1f51a3e7e1df",
@@ -120,6 +135,11 @@
 			},
 			{
 				"fragment" : "-Wl,-rpath,/usr/local/cuda-12.8/targets/x86_64-linux/lib",
+				"role" : "libraries"
+			},
+			{
+				"backtrace" : 2,
+				"fragment" : "libimgui.a",
 				"role" : "libraries"
 			},
 			{

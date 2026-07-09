@@ -314,4 +314,9 @@ CMakeFiles/renderer.dir/src/main.cpp.o: \
  /usr/lib/gcc/x86_64-linux-gnu/12/include/mmintrin.h \
  /usr/lib/gcc/x86_64-linux-gnu/12/include/mm_malloc.h \
  /home/mestay/renderer/include/stb_image_write.h \
+ /home/mestay/renderer/include/imgui/imgui.h \
+ /home/mestay/renderer/include/imgui/imconfig.h \
+ /usr/lib/gcc/x86_64-linux-gnu/12/include/float.h \
+ /home/mestay/renderer/include/imgui/backends/imgui_impl_glfw.h \
+ /home/mestay/renderer/include/imgui/backends/imgui_impl_opengl3.h \
  /usr/include/c++/12/iostream

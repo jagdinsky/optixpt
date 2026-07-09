@@ -51,13 +51,13 @@ static double gLastX = 0.0, gLastY = 0.0;
 static bool gFirstMouse = true;
 static float gYaw;
 static float gPitch;
-static bool gGuiMode = false;
+static bool guiMode = false;
 
 
 // Mouse callback to control camera orientation. Updates gYaw and gPitch based on mouse movement, and sets gCameraChanged to true when the camera is updated
 static void mouseCallback(GLFWwindow*, double xpos, double ypos)
 {
-    if (gGuiMode || ImGui::GetIO().WantCaptureMouse) {
+    if (guiMode || ImGui::GetIO().WantCaptureMouse) {
         gLastX = xpos;
         gLastY = ypos;
         gFirstMouse = false;
@@ -1036,14 +1036,28 @@ void buildPhotonGrid(Params& params,
     params.use_grid = 1;
 }
 
-bool renderOffline(const CameraFileState& cam, RendererState& state, Params& p) {
-    return true;
-}
+// main
+int main(int argc, char** argv) {
 
-bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p) {
-    int W = p.width, H = p.height;
+    // program arguments
+    RunArgs args{};
+    args = parseArgs(argc, argv);
+    CameraFileState cam{};
+    cam = loadCameraFile(args.cameraFile);
+
+    RendererState state;
+    Scene scene;
+    Params p = {};
+
+    // Initial camera state
+    p.cam_eye = cam.eye;
+    gYaw = cam.yaw;
+    gPitch = cam.pitch;
+    rebuildCameraVectors(p);
 
     GLFWwindow* window = initGL();
+    createContext(state);
+    std::cout << "Context created.\n";
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1060,7 +1074,37 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-       // Window / PBO setup
+    loadScene(args.sceneFile, scene, state);
+    std::cout << "Materials: " << scene.materials.size()
+              << ", Triangles: " << scene.triangles.size() << "\n";
+
+    // Build emissive light list
+    buildLightList(scene, state);
+
+    const int NUM_PHOTONS = 100'000'000;
+    Photon* dPhotonMap;
+    CUDA_CHECK(cudaMalloc(&dPhotonMap, NUM_PHOTONS * sizeof(Photon)));
+    int* dPhotonCount;
+    CUDA_CHECK(cudaMalloc(&dPhotonCount, sizeof(int)));
+    CUDA_CHECK(cudaMemset(dPhotonCount, 0, sizeof(int)));
+
+    p.photon_map = dPhotonMap;
+    p.num_photons = NUM_PHOTONS;
+    p.photon_count = dPhotonCount;
+    p.gather_radius = 1.0f; // tune for the scene
+    p.photon_power_scale = 50.0f; // tune for the scene
+    p.render_mode = 0; // start with path tracing
+
+    uploadSceneBuffers(scene, state);
+
+    buildAccel(state);
+    createModule(state);
+    createProgramGroups(state);
+    createPipeline(state);
+    createSBT(state);
+
+    // Window / PBO setup
+    int W = 1280, H = 720;
     GLuint pbo, displayTex;
     glGenBuffers(1, &pbo);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -1080,10 +1124,24 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
 
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
+    p.width = W;
+    p.height = H;
+    p.handle = state.gasHandle;
+    p.triangles = reinterpret_cast<Triangle*>(state.dTriangles);
+    p.materials = reinterpret_cast<Material*>(state.dMaterials);
+
+    // NEE light list
+    p.lights = reinterpret_cast<EmissiveTriangle*>(state.dLights);
+    p.num_lights = (int)state.hostLights.size();
+    p.total_light_area = 0.f;
+    for (const auto& lt : state.hostLights)
+        p.total_light_area += lt.area;
 
     p.samples_per_pixel = 4;
     p.max_depth = 8;
     p.frame_index = 0;
+
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dParams), sizeof(Params)));
 
     CUstream stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -1143,36 +1201,37 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         if (resetAccum) {
             p.frame_index = 0;
             CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
-            // photons_valid = false;
         }
 
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             break;
 
-        if (!gGuiMode && !ImGui::GetIO().WantCaptureKeyboard) {
+        if (!guiMode && !ImGui::GetIO().WantCaptureKeyboard) {
             handleKeys(window, p, 4.0f);
+        }
+
+        if (gCameraChanged) {
+            rebuildCameraVectors(p);
+
+            p.frame_index = 0;
+            CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
+
+            gCameraChanged = false;
         }
 
         static bool cKeyWasDown = false;
         bool cKeyDown = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
-        if (!gGuiMode && cKeyDown && !cKeyWasDown) {
+        if (!guiMode && cKeyDown && !cKeyWasDown) {
             p.cam_eye = cam.eye;
             gYaw = cam.yaw;
             gPitch = cam.pitch;
-            gCameraChanged = true;
+            CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
         }
         cKeyWasDown = cKeyDown;
 
-        if (gCameraChanged) {
-            rebuildCameraVectors(p);
-            p.frame_index = 0;
-            CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
-            gCameraChanged = false;
-        }
-
         static bool vKeyWasDown = false;
         bool vKeyDown = glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS;
-        if (!gGuiMode && vKeyDown && !vKeyWasDown) {
+        if (!guiMode && vKeyDown && !vKeyWasDown) {
             std::cout
                 << "\n=== Camera State ===\n"
                 << "p.cam_eye = make_float3("
@@ -1188,15 +1247,15 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         static bool f1WasDown = false;
         bool f1Down = glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS;
         if (f1Down && !f1WasDown) {
-            gGuiMode = !gGuiMode;
+            guiMode = !guiMode;
 
-            if (gGuiMode) {
+            if (guiMode) {
                 glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
             } else {
                 glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
                 gFirstMouse = true;
             }
-            std::cout << gGuiMode << '\n';
+            std::cout << guiMode << '\n';
         }
         f1WasDown = f1Down;
 
@@ -1235,12 +1294,11 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
                     state.dParams, sizeof(Params),
                     &sbtPhoton,
                     p.num_photons, 1, 1)); // 1D!
-                    
+
                 buildPhotonGrid(p, state.dGridCellStart, state.dGridCellCount, state.dGridPhotonIds);
                 CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params), cudaMemcpyHostToDevice));
 
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                    
                 photons_valid = true;
             }
 
@@ -1280,108 +1338,23 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     ImGui::DestroyContext();
     cudaStreamDestroy(stream);
     cudaFree(reinterpret_cast<void*>(dAccum));
+    cudaFree(reinterpret_cast<void*>(state.dParams));
+    if (state.dLights)
+        cudaFree(reinterpret_cast<void*>(state.dLights));
     cudaGraphicsUnregisterResource(cudaPBO);
+    cudaFree(dPhotonMap);
+    cudaFree(dPhotonCount);
+    cudaFree(reinterpret_cast<void*>(state.drg_photon));
+    cudaFree(reinterpret_cast<void*>(state.drg_gather));
+
+    for (auto tex : state.texObjects)
+        cudaDestroyTextureObject(tex);
+    for (auto arr : state.texArrays)
+        cudaFreeArray(arr);
 
     glDeleteBuffers(1, &pbo);
     glDeleteTextures(1, &displayTex);
     glfwDestroyWindow(window);
     glfwTerminate();
-    return true; // Return true if successful
-}
-
-// main
-int main(int argc, char** argv) {
-
-    // program arguments
-    RunArgs args{};
-    args = parseArgs(argc, argv);
-    CameraFileState cam{};
-    cam = loadCameraFile(args.cameraFile);
-
-    RendererState state;
-    Scene scene;
-    Params p = {};
-
-    // Initial camera state
-    p.cam_eye = cam.eye;
-    gYaw = cam.yaw;
-    gPitch = cam.pitch;
-    rebuildCameraVectors(p);
-
-    createContext(state);
-    std::cout << "Context created.\n";
-
-    loadScene(args.sceneFile, scene, state);
-    std::cout << "Materials: " << scene.materials.size()
-              << ", Triangles: " << scene.triangles.size() << "\n";
-
-    // Build emissive light list
-    buildLightList(scene, state);
-
-    const int NUM_PHOTONS = 10'000'000;
-    Photon* dPhotonMap;
-    CUDA_CHECK(cudaMalloc(&dPhotonMap, NUM_PHOTONS * sizeof(Photon)));
-    int* dPhotonCount;
-    CUDA_CHECK(cudaMalloc(&dPhotonCount, sizeof(int)));
-    CUDA_CHECK(cudaMemset(dPhotonCount, 0, sizeof(int)));
-
-    p.photon_map = dPhotonMap;
-    p.num_photons = NUM_PHOTONS;
-    p.photon_count = dPhotonCount;
-    p.gather_radius = 1.0f; // tune for the scene
-    p.photon_power_scale = 50.0f; // tune for the scene
-    p.render_mode = 0; // start with path tracing
-
-    uploadSceneBuffers(scene, state);
-
-    buildAccel(state);
-    createModule(state);
-    createProgramGroups(state);
-    createPipeline(state);
-    createSBT(state);
-
-    int W = 1280, H = 720;
-
-    p.width = W;
-    p.height = H;
-    p.handle = state.gasHandle;
-    p.triangles = reinterpret_cast<Triangle*>(state.dTriangles);
-    p.materials = reinterpret_cast<Material*>(state.dMaterials);
-
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dParams), sizeof(Params)));
-
-    // NEE light list
-    p.lights = reinterpret_cast<EmissiveTriangle*>(state.dLights);
-    p.num_lights = (int)state.hostLights.size();
-    p.total_light_area = 0.f;
-    for (const auto& lt : state.hostLights)
-        p.total_light_area += lt.area;
-    
-    if(args.offline) {
-        if (!renderOffline(cam, state, p)) {
-            std::cerr << "Offline rendering failed.\n";
-            return 1;
-        }
-    } else {
-        if (!renderRealtime(cam, state, p)) {
-            std::cerr << "Realtime rendering failed.\n";
-            return 1;
-        }
-    }
-
-    // Cleanups
-    cudaFree(dPhotonMap);
-    cudaFree(dPhotonCount);
-    cudaFree(reinterpret_cast<void*>(state.dParams));
-    if (state.dLights)
-        cudaFree(reinterpret_cast<void*>(state.dLights));
-    cudaFree(reinterpret_cast<void*>(state.drg_photon));
-    cudaFree(reinterpret_cast<void*>(state.drg_gather));
-    for (auto tex : state.texObjects)
-        cudaDestroyTextureObject(tex);
-    for (auto arr : state.texArrays)
-        cudaFreeArray(arr);
- 
     return 0;
 }

@@ -92,6 +92,7 @@ renderer_EXTERNAL_OBJECTS =
 
 renderer: CMakeFiles/renderer.dir/src/main.cpp.o
 renderer: CMakeFiles/renderer.dir/build.make
+renderer: libimgui.a
 renderer: /usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs/libcuda.so
 renderer: /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcudart.so
 renderer: /usr/lib/x86_64-linux-gnu/libglfw.so.3.3

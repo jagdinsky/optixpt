@@ -10,6 +10,10 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
   /home/mestay/optix/include/optix_stack_size.h \
   /home/mestay/optix/include/optix_stubs.h \
   /home/mestay/optix/include/optix_types.h \
+  /home/mestay/renderer/include/imgui/backends/imgui_impl_glfw.h \
+  /home/mestay/renderer/include/imgui/backends/imgui_impl_opengl3.h \
+  /home/mestay/renderer/include/imgui/imconfig.h \
+  /home/mestay/renderer/include/imgui/imgui.h \
   /home/mestay/renderer/include/json.hpp \
   /home/mestay/renderer/include/stb_image.h \
   /home/mestay/renderer/include/stb_image_write.h \
@@ -366,6 +370,7 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
   /usr/include/x86_64-linux-gnu/sys/stat.h \
   /usr/include/x86_64-linux-gnu/sys/types.h \
   /usr/lib/gcc/x86_64-linux-gnu/12/include/emmintrin.h \
+  /usr/lib/gcc/x86_64-linux-gnu/12/include/float.h \
   /usr/lib/gcc/x86_64-linux-gnu/12/include/limits.h \
   /usr/lib/gcc/x86_64-linux-gnu/12/include/mm_malloc.h \
   /usr/lib/gcc/x86_64-linux-gnu/12/include/mmintrin.h \
@@ -576,11 +581,9 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/x86_64-linux-gnu/bits/floatn.h:
 
-/usr/include/c++/12/numeric:
+/usr/include/x86_64-linux-gnu/bits/errno.h:
 
-/usr/include/x86_64-linux-gnu/gnu/stubs.h:
-
-/usr/include/c++/12/vector:
+/usr/include/x86_64-linux-gnu/bits/endian.h:
 
 /usr/include/c++/12/bits/stl_tempbuf.h:
 
@@ -610,8 +613,6 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/c++/12/pstl/glue_memory_defs.h:
 
-/usr/include/c++/12/bits/refwrap.h:
-
 /usr/include/c++/12/stdlib.h:
 
 /usr/include/c++/12/bits/range_access.h:
@@ -629,6 +630,8 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 /usr/include/c++/12/bits/streambuf.tcc:
 
 /usr/include/c++/12/bits/ostream.tcc:
+
+/home/mestay/renderer/include/imgui/imconfig.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/clock_t.h:
 
@@ -657,6 +660,8 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 /usr/include/c++/12/bits/stl_tree.h:
 
 /usr/include/c++/12/bits/new_allocator.h:
+
+/home/mestay/renderer/include/imgui/backends/imgui_impl_glfw.h:
 
 /usr/include/c++/12/cerrno:
 
@@ -700,6 +705,18 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/c++/12/bits/fstream.tcc:
 
+/usr/local/cuda-12.8/targets/x86_64-linux/include/driver_types.h:
+
+/usr/include/c++/12/bits/mask_array.h:
+
+/usr/include/c++/12/bits/fs_dir.h:
+
+/usr/include/c++/12/bits/ostream_insert.h:
+
+/usr/include/x86_64-linux-gnu/bits/endianness.h:
+
+/usr/include/c++/12/bits/forward_list.h:
+
 /usr/include/assert.h:
 
 /usr/include/c++/12/bits/valarray_array.h:
@@ -722,10 +739,6 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/c++/12/bits/char_traits.h:
 
-/usr/include/c++/12/array:
-
-/usr/include/c++/12/valarray:
-
 /usr/include/x86_64-linux-gnu/c++/12/bits/c++config.h:
 
 /usr/include/GL/glew.h:
@@ -740,11 +753,33 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/c++/12/bits/enable_special_members.h:
 
+/usr/include/alloca.h:
+
+/usr/include/x86_64-linux-gnu/bits/floatn-common.h:
+
+/usr/include/c++/12/bits/algorithmfwd.h:
+
+/usr/include/GL/gl.h:
+
+/usr/include/c++/12/compare:
+
+/usr/include/c++/12/bits/gslice_array.h:
+
+/usr/include/c++/12/bits/atomic_lockfree_defines.h:
+
+/home/mestay/optix/include/optix_function_table.h:
+
+/usr/include/asm-generic/errno-base.h:
+
+/usr/include/x86_64-linux-gnu/bits/cpu-set.h:
+
+/usr/include/x86_64-linux-gnu/asm/posix_types_64.h:
+
+/usr/include/c++/12/bits/stl_map.h:
+
+/usr/include/c++/12/bits/basic_string.tcc:
+
 /home/mestay/renderer/src/params.h:
-
-/usr/include/c++/12/bits/hashtable_policy.h:
-
-/home/mestay/optix/include/GLFW/glfw3.h:
 
 /usr/local/cuda-12.8/targets/x86_64-linux/include/driver_functions.h:
 
@@ -758,11 +793,13 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /home/mestay/optix/include/optix_stubs.h:
 
-/home/mestay/optix/include/optix_function_table.h:
+/home/mestay/renderer/include/imgui/imgui.h:
 
-/usr/include/c++/12/bits/gslice_array.h:
+/usr/include/c++/12/numeric:
 
-/usr/include/c++/12/bits/atomic_lockfree_defines.h:
+/usr/include/x86_64-linux-gnu/gnu/stubs.h:
+
+/usr/include/c++/12/vector:
 
 /usr/include/x86_64-linux-gnu/bits/stdlib.h:
 
@@ -770,37 +807,23 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /home/mestay/renderer/include/json.hpp:
 
-/usr/local/cuda-12.8/targets/x86_64-linux/include/driver_types.h:
+/usr/include/asm-generic/posix_types.h:
 
-/usr/include/c++/12/bits/mask_array.h:
+/usr/include/c++/12/bits/stl_heap.h:
 
-/home/mestay/renderer/include/stb_image.h:
+/usr/include/c++/12/bits/fs_ops.h:
 
-/usr/include/asm-generic/errno-base.h:
+/usr/local/cuda-12.8/targets/x86_64-linux/include/vector_functions.h:
 
-/usr/include/x86_64-linux-gnu/bits/cpu-set.h:
+/usr/include/c++/12/bits/unique_ptr.h:
 
-/usr/include/x86_64-linux-gnu/asm/posix_types_64.h:
+/usr/include/c++/12/iterator:
 
-/usr/include/x86_64-linux-gnu/c++/12/bits/ctype_base.h:
+/usr/include/GL/glu.h:
 
-/usr/include/c++/12/bits/atomic_base.h:
+/usr/include/c++/12/tr1/poly_hermite.tcc:
 
-/usr/include/c++/12/cctype:
-
-/usr/include/c++/12/istream:
-
-/usr/include/c++/12/stdexcept:
-
-/usr/include/c++/12/bits/locale_facets.h:
-
-/home/mestay/optix/include/optix.h:
-
-/usr/include/c++/12/string_view:
-
-/usr/include/alloca.h:
-
-/usr/include/c++/12/compare:
+/home/mestay/optix/include/GLFW/glfw3.h:
 
 /usr/local/cuda-12.8/targets/x86_64-linux/include/cuda.h:
 
@@ -820,33 +843,31 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /home/mestay/optix/include/optix_stack_size.h:
 
+/usr/include/c++/12/bits/hashtable_policy.h:
+
+/usr/include/c++/12/bits/refwrap.h:
+
+/home/mestay/renderer/include/imgui/backends/imgui_impl_opengl3.h:
+
+/home/mestay/renderer/include/stb_image.h:
+
+/usr/include/x86_64-linux-gnu/c++/12/bits/ctype_base.h:
+
+/usr/include/c++/12/bits/atomic_base.h:
+
+/usr/include/c++/12/cctype:
+
+/usr/include/c++/12/istream:
+
+/usr/include/c++/12/stdexcept:
+
+/usr/include/c++/12/bits/locale_facets.h:
+
+/home/mestay/optix/include/optix.h:
+
+/usr/include/c++/12/string_view:
+
 /usr/include/c++/12/algorithm:
-
-/usr/include/asm-generic/posix_types.h:
-
-/usr/include/c++/12/bits/stl_heap.h:
-
-/usr/include/c++/12/bits/fs_ops.h:
-
-/usr/local/cuda-12.8/targets/x86_64-linux/include/vector_functions.h:
-
-/usr/include/c++/12/bits/unique_ptr.h:
-
-/usr/include/c++/12/iterator:
-
-/usr/include/c++/12/bits/algorithmfwd.h:
-
-/usr/include/GL/gl.h:
-
-/usr/include/x86_64-linux-gnu/bits/floatn-common.h:
-
-/usr/include/GL/glu.h:
-
-/usr/include/c++/12/tr1/poly_hermite.tcc:
-
-/usr/include/c++/12/bits/stl_map.h:
-
-/usr/include/c++/12/bits/basic_string.tcc:
 
 /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h:
 
@@ -856,23 +877,15 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /home/mestay/renderer/include/stb_image_write.h:
 
+/usr/include/c++/12/array:
+
+/usr/include/c++/12/valarray:
+
 /usr/include/x86_64-linux-gnu/bits/struct_rwlock.h:
 
 /usr/include/c++/12/bit:
 
 /usr/include/c++/12/bits/specfun.h:
-
-/usr/include/c++/12/ios:
-
-/usr/include/c++/12/bits/stream_iterator.h:
-
-/usr/include/x86_64-linux-gnu/bits/strings_fortified.h:
-
-/usr/include/c++/12/bits/valarray_array.tcc:
-
-/usr/include/stdlib.h:
-
-/usr/include/c++/12/tr1/modified_bessel_func.tcc:
 
 /usr/include/x86_64-linux-gnu/bits/wctype-wchar.h:
 
@@ -932,11 +945,17 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/c++/12/bits/exception_ptr.h:
 
-/usr/include/c++/12/bits/ostream_insert.h:
+/usr/include/c++/12/ios:
 
-/usr/include/x86_64-linux-gnu/bits/endian.h:
+/usr/include/c++/12/bits/stream_iterator.h:
 
-/usr/include/c++/12/bits/fs_dir.h:
+/usr/include/x86_64-linux-gnu/bits/strings_fortified.h:
+
+/usr/include/c++/12/bits/valarray_array.tcc:
+
+/usr/include/c++/12/tr1/modified_bessel_func.tcc:
+
+/usr/include/stdlib.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/struct_statx.h:
 
@@ -1112,6 +1131,8 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/c++/12/version:
 
+/usr/lib/gcc/x86_64-linux-gnu/12/include/float.h:
+
 /usr/include/c++/12/cstring:
 
 /usr/include/ctype.h:
@@ -1122,19 +1143,15 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 
 /usr/include/libintl.h:
 
-/usr/include/c++/12/bits/forward_list.h:
-
-/usr/include/x86_64-linux-gnu/bits/endianness.h:
-
 /usr/include/linux/errno.h:
 
 /usr/include/linux/limits.h:
 
-/usr/include/c++/12/bits/string_view.tcc:
-
 /usr/include/c++/12/bits/predefined_ops.h:
 
 /usr/include/endian.h:
+
+/usr/include/c++/12/bits/string_view.tcc:
 
 /usr/include/stdint.h:
 
@@ -1167,8 +1184,6 @@ CMakeFiles/renderer.dir/src/main.cpp.o: /home/mestay/renderer/src/main.cpp \
 /usr/include/sched.h:
 
 /usr/include/wctype.h:
-
-/usr/include/x86_64-linux-gnu/bits/errno.h:
 
 /usr/include/x86_64-linux-gnu/bits/dl_find_object.h:
 
