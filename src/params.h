@@ -104,6 +104,7 @@ struct Params {
 
     // Render mode flag
     int render_mode; // 0 = path tracer, 1 = photon mapping
+    int offline_frames; // total number of frames to render in offline mode
 
     // Photon power scaling factor (to adjust brightness)
     float photon_power_scale;

@@ -143,6 +143,19 @@ imgui/fast:
 .PHONY : imgui/fast
 
 #=============================================================================
+# Target rules for targets named miniz
+
+# Build rule for target.
+miniz: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 miniz
+.PHONY : miniz
+
+# fast build rule for target.
+miniz/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/miniz.dir/build.make CMakeFiles/miniz.dir/build
+.PHONY : miniz/fast
+
+#=============================================================================
 # Target rules for targets named renderer
 
 # Build rule for target.
@@ -323,6 +336,30 @@ include/imgui/imgui_widgets.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/imgui.dir/build.make CMakeFiles/imgui.dir/include/imgui/imgui_widgets.cpp.s
 .PHONY : include/imgui/imgui_widgets.cpp.s
 
+include/miniz.o: include/miniz.c.o
+.PHONY : include/miniz.o
+
+# target to build an object file
+include/miniz.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/miniz.dir/build.make CMakeFiles/miniz.dir/include/miniz.c.o
+.PHONY : include/miniz.c.o
+
+include/miniz.i: include/miniz.c.i
+.PHONY : include/miniz.i
+
+# target to preprocess a source file
+include/miniz.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/miniz.dir/build.make CMakeFiles/miniz.dir/include/miniz.c.i
+.PHONY : include/miniz.c.i
+
+include/miniz.s: include/miniz.c.s
+.PHONY : include/miniz.s
+
+# target to generate assembly for a file
+include/miniz.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/miniz.dir/build.make CMakeFiles/miniz.dir/include/miniz.c.s
+.PHONY : include/miniz.c.s
+
 src/device.o: src/device.cu.o
 .PHONY : src/device.o
 
@@ -381,6 +418,7 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... device_ptx"
 	@echo "... imgui"
+	@echo "... miniz"
 	@echo "... renderer"
 	@echo "... include/imgui/backends/imgui_impl_glfw.o"
 	@echo "... include/imgui/backends/imgui_impl_glfw.i"
@@ -403,6 +441,9 @@ help:
 	@echo "... include/imgui/imgui_widgets.o"
 	@echo "... include/imgui/imgui_widgets.i"
 	@echo "... include/imgui/imgui_widgets.s"
+	@echo "... include/miniz.o"
+	@echo "... include/miniz.i"
+	@echo "... include/miniz.s"
 	@echo "... src/device.o"
 	@echo "... src/device.i"
 	@echo "... src/device.s"

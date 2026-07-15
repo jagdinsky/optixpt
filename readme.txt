@@ -17,3 +17,5 @@ __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.gl
 // code-styling:
 // find . -regex '.*\.\(cpp\|hpp\|cu\|cuh\|c\|h\)' -exec clang-format -style=WebKit -i {} \;
 
+// references notes: tinyexr 1.0.2 by syoyo
+

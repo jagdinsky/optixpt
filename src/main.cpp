@@ -20,6 +20,9 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+#define TINYEXR_IMPLEMENTATION
+#include "tinyexr.h"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -80,13 +83,23 @@ static void mouseCallback(GLFWwindow*, double xpos, double ypos)
 // Recomputes the camera basis vectors (cam_u, cam_v, cam_w) based on the current gYaw and gPitch angles
 static void rebuildCameraVectors(Params& p)
 {
+    if (p.width <= 0 || p.height <= 0) {
+        std::cerr << "Invalid render resolution in rebuildCameraVectors\n";
+        return;
+    }
+
     float yr = gYaw * M_PI / 180.f;
     float pr = gPitch * M_PI / 180.f;
 
     // forward в glTF (Y-up, right-handed)
     float3 fwd = make_float3(cosf(pr) * cosf(yr), sinf(pr), cosf(pr) * sinf(yr));
-    float len = sqrtf(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z);
-    fwd = make_float3(fwd.x / len, fwd.y / len, fwd.z / len);
+    float len2 = fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z;
+    if (len2 < 1e-20f) {
+        fwd = make_float3(0.f, 0.f, 1.f);
+    } else {
+        float inv = 1.0f / sqrtf(len2);
+        fwd = make_float3(fwd.x * inv, fwd.y * inv, fwd.z * inv);
+    }
 
     float3 worldUp = make_float3(0.f, 1.f, 0.f);
 
@@ -95,8 +108,13 @@ static void rebuildCameraVectors(Params& p)
         fwd.y * worldUp.z - fwd.z * worldUp.y,
         fwd.z * worldUp.x - fwd.x * worldUp.z,
         fwd.x * worldUp.y - fwd.y * worldUp.x);
-    float rlen = sqrtf(right.x * right.x + right.y * right.y + right.z * right.z);
-    right = make_float3(right.x / rlen, right.y / rlen, right.z / rlen);
+    float rlen2 = right.x * right.x + right.y * right.y + right.z * right.z;
+    if (rlen2 < 1e-20f) {
+        right = make_float3(1.f, 0.f, 0.f);
+    } else {
+        float inv = 1.0f / sqrtf(rlen2);
+        right = make_float3(right.x * inv, right.y * inv, right.z * inv);
+    }
 
     // up = right × fwd
     float3 up = make_float3(
@@ -289,6 +307,7 @@ static cudaTextureObject_t uploadTexture(RendererState& state,
 struct RunArgs {
     std::string sceneFile = "scene.glb";
     bool offline = false;
+    bool photon = false;
     std::string cameraFile = "camera.txt";
     std::string outputFile = "../build/output.exr";
 };
@@ -300,6 +319,8 @@ static RunArgs parseArgs(int argc, char** argv) {
 
         if (a == "--offline") {
             args.offline = true;
+        } else if (a == "--photon") {
+            args.photon = true;
         } else if (a == "--camera" && i + 1 < argc) {
             args.cameraFile = argv[++i];
         } else if (a == "--output" && i + 1 < argc) {
@@ -1036,8 +1057,188 @@ void buildPhotonGrid(Params& params,
     params.use_grid = 1;
 }
 
-bool renderOffline(const CameraFileState& cam, RendererState& state, Params& p) {
+static bool saveEXR(const std::string& filename,
+                    const std::vector<float3>& hdr,
+                    int width, int height) {
+    std::vector<float> images[3];
+    images[0].resize(width * height);
+    images[1].resize(width * height);
+    images[2].resize(width * height);
+
+    for (int y = 0; y < height; ++y) {
+        int srcY = height - 1 - y; // vertical flip
+        for (int x = 0; x < width; ++x) {
+            int dst = y * width + x;
+            int src = srcY * width + x;
+
+            images[0][dst] = hdr[src].x; // R
+            images[1][dst] = hdr[src].y; // G
+            images[2][dst] = hdr[src].z; // B
+        }
+    }
+
+    EXRHeader header;
+    InitEXRHeader(&header);
+
+    EXRImage image;
+    InitEXRImage(&image);
+
+    image.num_channels = 3;
+
+    std::vector<float*> image_ptrs = {
+        images[2].data(), // B
+        images[1].data(), // G
+        images[0].data()  // R
+    };
+    image.images = reinterpret_cast<unsigned char**>(image_ptrs.data());
+    image.width = width;
+    image.height = height;
+
+    header.num_channels = 3;
+    header.channels = (EXRChannelInfo*)malloc(sizeof(EXRChannelInfo) * header.num_channels);
+    strncpy(header.channels[0].name, "B", 255);
+    strncpy(header.channels[1].name, "G", 255);
+    strncpy(header.channels[2].name, "R", 255);
+
+    header.pixel_types = (int*)malloc(sizeof(int) * header.num_channels);
+    header.requested_pixel_types = (int*)malloc(sizeof(int) * header.num_channels);
+    for (int i = 0; i < 3; ++i) {
+        header.pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+        header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_HALF; // или FLOAT
+    }
+
+    const char* err = nullptr;
+    int ret = SaveEXRImageToFile(&image, &header, filename.c_str(), &err);
+
+    free(header.channels);
+    free(header.pixel_types);
+    free(header.requested_pixel_types);
+
+    if (ret != TINYEXR_SUCCESS) {
+        if (err) {
+            std::cerr << "SaveEXR error: " << err << "\n";
+            FreeEXRErrorMessage(err);
+        }
+        return false;
+    }
+
     return true;
+}
+
+void launchPathTracing(RendererState& state, Params& p, CUstream& stream) {
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
+                                &p, sizeof(Params),
+                                cudaMemcpyHostToDevice, stream));
+    OPTIX_CHECK(optixLaunch(state.pipeline, stream,
+                            state.dParams, sizeof(Params),
+                            &state.sbt, p.width, p.height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void launchPhotonTracing(RendererState& state, Params& p, CUstream& stream) {
+    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(p.photon_count),
+                              0, sizeof(int), stream));
+
+    OptixShaderBindingTable sbtPhoton = state.sbt;
+    sbtPhoton.raygenRecord = state.drg_photon;
+
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
+                              &p, sizeof(Params),
+                              cudaMemcpyHostToDevice, stream));
+    OPTIX_CHECK(optixLaunch(state.pipeline, stream,
+                            state.dParams, sizeof(Params),
+                            &sbtPhoton, p.num_photons, 1, 1));
+
+    buildPhotonGrid(p,
+                    state.dGridCellStart,
+                    state.dGridCellCount,
+                    state.dGridPhotonIds);
+
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams),
+                          &p,
+                          sizeof(Params),
+                          cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void launchPhotonGathering(RendererState& state, Params& p, CUstream& stream) {
+    OptixShaderBindingTable sbtGather = state.sbt;
+    sbtGather.raygenRecord = state.drg_gather;
+
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
+                              &p, sizeof(Params),
+                              cudaMemcpyHostToDevice, stream));
+    OPTIX_CHECK(optixLaunch(state.pipeline, stream,
+                            state.dParams, sizeof(Params),
+                            &sbtGather, p.width, p.height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+static bool renderOffline(RendererState& state, Params& p, const std::string& outputFile)
+{
+    const int W = static_cast<int>(p.width);
+    const int H = static_cast<int>(p.height);
+
+    uchar4* dFrame = nullptr;
+    float3* dAccum = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dFrame), W * H * sizeof(uchar4)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dAccum), W * H * sizeof(float3)));
+    CUDA_CHECK(cudaMemset(dFrame, 0, W * H * sizeof(uchar4)));
+    CUDA_CHECK(cudaMemset(dAccum, 0, W * H * sizeof(float3)));
+
+    CUstream stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    p.frame_buffer = dFrame;
+    p.accum_buffer = reinterpret_cast<float3*>(dAccum);
+    p.frame_index  = 0;
+
+    bool photons_valid = false;
+
+    for (int f = 0; f < p.offline_frames; ++f) {
+
+        if (p.render_mode == 0) {
+            // Path Tracing launch
+            launchPathTracing(state, p, stream);
+        } else {
+            // Photon Mapping launch
+            if (!photons_valid) {
+                // Pass 1 — Photon tracing
+                launchPhotonTracing(state, p, stream);
+
+                photons_valid = true;
+            }
+
+            // Pass 2 — Gathering
+            launchPhotonGathering(state, p, stream);
+        }
+
+        p.frame_index++;
+        std::cout << "\rOffline frame " << (f + 1) << "/" << p.offline_frames << std::flush;
+    }
+
+    std::cout << "\n";
+
+    // Читаем accum_buffer и усредняем
+    std::vector<float3> hostAccum(W * H);
+    CUDA_CHECK(cudaMemcpy(hostAccum.data(), dAccum,
+                          W * H * sizeof(float3), cudaMemcpyDeviceToHost));
+
+    const float invF = 1.0f / float(p.offline_frames);
+    for (auto& c : hostAccum) {
+        c.x *= invF; if (!std::isfinite(c.x)) c.x = 0.f;
+        c.y *= invF; if (!std::isfinite(c.y)) c.y = 0.f;
+        c.z *= invF; if (!std::isfinite(c.z)) c.z = 0.f;
+    }
+
+    bool ok = saveEXR(outputFile, hostAccum, W, H);
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaFree(dFrame));
+    CUDA_CHECK(cudaFree(dAccum));
+    
+    return ok;
 }
 
 bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p) {
@@ -1081,8 +1282,6 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
 
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
 
-    p.samples_per_pixel = 4;
-    p.max_depth = 8;
     p.frame_index = 0;
 
     CUstream stream;
@@ -1209,52 +1408,18 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
 
         if (p.render_mode == 0) {
             // Path Tracing launch
-            CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
-                &p, sizeof(p), cudaMemcpyHostToDevice, stream));
-            OPTIX_CHECK(optixLaunch(state.pipeline, stream,
-                state.dParams, sizeof(Params),
-                &state.sbt, // raygen = __raygen__rg
-                W, H, 1));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-
+            launchPathTracing(state, p, stream);
         } else {
             // Photon Mapping launch
-
-            // Pass 1 — Photon Tracing (1D launch: NUM_PHOTONS threads, each tracing one photon)
-            // Reset photon count every time
             if (!photons_valid) {
-                CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(p.photon_count),
-                    0, sizeof(int), stream));
-
-                OptixShaderBindingTable sbtPhoton = state.sbt;
-                sbtPhoton.raygenRecord = state.drg_photon;
-
-                CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
-                    &p, sizeof(p), cudaMemcpyHostToDevice, stream));
-                OPTIX_CHECK(optixLaunch(state.pipeline, stream,
-                    state.dParams, sizeof(Params),
-                    &sbtPhoton,
-                    p.num_photons, 1, 1)); // 1D!
-                    
-                buildPhotonGrid(p, state.dGridCellStart, state.dGridCellCount, state.dGridPhotonIds);
-                CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params), cudaMemcpyHostToDevice));
-
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                // Pass 1 — Photon tracing
+                launchPhotonTracing(state, p, stream);
                     
                 photons_valid = true;
             }
 
-            // Pass 2 — Gathering (2D launch: W×H threads, each gathering photons for one pixel)
-            OptixShaderBindingTable sbtGather = state.sbt;
-            sbtGather.raygenRecord = state.drg_gather;
-
-            CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
-                &p, sizeof(p), cudaMemcpyHostToDevice, stream));
-            OPTIX_CHECK(optixLaunch(state.pipeline, stream,
-                state.dParams, sizeof(Params),
-                &sbtGather,
-                W, H, 1)); // 2D as PT
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Pass 2 — Gathering
+            launchPhotonGathering(state, p, stream);
         }
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaPBO, stream));
@@ -1302,6 +1467,11 @@ int main(int argc, char** argv) {
     Scene scene;
     Params p = {};
 
+    int W = 1280, H = 720;
+
+    p.width = W;
+    p.height = H;
+
     // Initial camera state
     p.cam_eye = cam.eye;
     gYaw = cam.yaw;
@@ -1318,19 +1488,24 @@ int main(int argc, char** argv) {
     // Build emissive light list
     buildLightList(scene, state);
 
-    const int NUM_PHOTONS = 10'000'000;
+    p.num_photons = 100'000'000;
     Photon* dPhotonMap;
-    CUDA_CHECK(cudaMalloc(&dPhotonMap, NUM_PHOTONS * sizeof(Photon)));
+    CUDA_CHECK(cudaMalloc(&dPhotonMap, p.num_photons * sizeof(Photon)));
     int* dPhotonCount;
     CUDA_CHECK(cudaMalloc(&dPhotonCount, sizeof(int)));
     CUDA_CHECK(cudaMemset(dPhotonCount, 0, sizeof(int)));
-
+    
+    p.offline_frames = 8; // number of frames to render in offline mode
     p.photon_map = dPhotonMap;
-    p.num_photons = NUM_PHOTONS;
     p.photon_count = dPhotonCount;
     p.gather_radius = 1.0f; // tune for the scene
     p.photon_power_scale = 50.0f; // tune for the scene
-    p.render_mode = 0; // start with path tracing
+    p.samples_per_pixel = 4;
+    p.max_depth         = 8;
+    p.render_mode = 0; // start with path tracing by default
+    if (args.photon) {
+        p.render_mode = 1; // start with photon mapping
+    }
 
     uploadSceneBuffers(scene, state);
 
@@ -1340,10 +1515,6 @@ int main(int argc, char** argv) {
     createPipeline(state);
     createSBT(state);
 
-    int W = 1280, H = 720;
-
-    p.width = W;
-    p.height = H;
     p.handle = state.gasHandle;
     p.triangles = reinterpret_cast<Triangle*>(state.dTriangles);
     p.materials = reinterpret_cast<Material*>(state.dMaterials);
@@ -1359,7 +1530,7 @@ int main(int argc, char** argv) {
         p.total_light_area += lt.area;
     
     if(args.offline) {
-        if (!renderOffline(cam, state, p)) {
+        if (!renderOffline(state, p, args.outputFile)) {
             std::cerr << "Offline rendering failed.\n";
             return 1;
         }

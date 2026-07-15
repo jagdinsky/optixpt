@@ -24,7 +24,9 @@ __device__ __forceinline__ float dot(float3 a, float3 b) { return a.x * b.x + a.
 __device__ __forceinline__ float3 cross(float3 a, float3 b) { return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
 __device__ __forceinline__ float3 normalize(float3 v)
 {
-    float inv = 1.f / sqrtf(dot(v, v));
+    float len2 = dot(v, v);
+    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 0.f);
+    float inv = rsqrtf(len2);
     return make_float3(v.x * inv, v.y * inv, v.z * inv);
 }
 __device__ __forceinline__ float length(float3 v) { return sqrtf(dot(v, v)); }
