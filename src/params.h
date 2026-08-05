@@ -103,9 +103,12 @@ struct Params {
     int use_grid; // 0 = brute-force, 1 = grid lookup
 
     // Render mode flag
-    int render_mode; // 0 = path tracer, 1 = photon mapping
+    int render_mode; // 0 = path tracer, 1 = photon mapping, 2 = photon tracing only
     int offline_frames; // total number of frames to render in offline mode
 
     // Photon power scaling factor (to adjust brightness)
     float photon_power_scale;
+
+    // Light visualization buffer (for photon tracing only mode)
+    float* lightvis_buffer;
 };

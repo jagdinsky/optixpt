@@ -801,3 +801,58 @@ extern "C" __global__ void __miss__shadow()
 {
     optixSetPayload_0(1u); // unoccluded = true
 }
+
+extern "C" __global__ void __raygen__lightvis()
+{
+    const int pid = (int)optixGetLaunchIndex().x;
+
+    const int stored = min(*params.photon_count, params.num_photons);
+    if (pid >= stored)
+        return;
+
+    const Photon& ph = params.photon_map[pid];
+
+    // Photon projection to camera plane (rasterization)
+    float3 toP = ph.pos - params.cam_eye;
+
+    float cam_w_len = length(params.cam_w);
+    if (cam_w_len < 1e-10f) return;
+    float3 cam_w_norm = params.cam_w * (1.f / cam_w_len);
+
+    // Depth along the forward axis
+    float depth = dot(toP, cam_w_norm);
+    if (depth < 1e-3f) return;   // behind the camera
+
+    // Scales of cam_u and cam_v (= h*aspect and h)
+    float u_scale = length(params.cam_u);
+    float v_scale = length(params.cam_v);
+    if (u_scale < 1e-10f || v_scale < 1e-10f) return;
+
+    float3 cam_u_norm = params.cam_u * (1.f / u_scale);
+    float3 cam_v_norm = params.cam_v * (1.f / v_scale);
+
+    // NDC coordinates: px, py ∈ [-1, 1]
+    float px = dot(toP, cam_u_norm) / (depth * u_scale);
+    float py = dot(toP, cam_v_norm) / (depth * v_scale);
+
+    if (px < -1.f || px > 1.f || py < -1.f || py > 1.f)
+        return;
+
+    // Raster coordinates (Y down, X right)
+    int ix = (int)((px * 0.5f + 0.5f) * (float)params.width);
+    int iy = (int)((py * 0.5f + 0.5f) * (float)params.height);
+    ix = max(0, min(ix, (int)params.width  - 1));
+    iy = max(0, min(iy, (int)params.height - 1));
+
+    // Shadow ray
+    if (!isVisible(ph.pos, params.cam_eye))
+        return;
+
+    // Atomic splat in lightvis_buffer
+    // lightvis_buffer is stored as float* (3 floats per pixel, interleaved)
+    int pixel = iy * (int)params.width + ix;
+    float* buf = params.lightvis_buffer;
+    atomicAdd(buf + pixel * 3 + 0, ph.power.x);
+    atomicAdd(buf + pixel * 3 + 1, ph.power.y);
+    atomicAdd(buf + pixel * 3 + 2, ph.power.z);
+}

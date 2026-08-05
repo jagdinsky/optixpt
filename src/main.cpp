@@ -235,6 +235,10 @@ struct RendererState {
     // Texture tracking
     std::vector<cudaArray_t> texArrays;
     std::vector<cudaTextureObject_t> texObjects;
+
+    // Light visualization launch group and device pointer for photon tracing only mode
+    OptixProgramGroup lightvisRaygenGroup = nullptr;
+    CUdeviceptr drg_lightvis = 0;                     
 };
 
 struct Scene {
@@ -722,6 +726,15 @@ void createProgramGroups(RendererState& state)
     gatherRd.raygen.entryFunctionName = "__raygen__gather";
     OPTIX_CHECK(optixProgramGroupCreate(state.context, &gatherRd, 1, &pgo,
         log, &ls, &state.gatherRaygenGroup));
+
+    // Light visualization raygen
+    OptixProgramGroupDesc lightvisRd = {};
+    lightvisRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    lightvisRd.raygen.module = state.ptxModule;
+    lightvisRd.raygen.entryFunctionName = "__raygen__lightvis";
+    OptixProgramGroupOptions opts = {};
+    OPTIX_CHECK(optixProgramGroupCreate(
+        state.context, &lightvisRd, 1, &pgo, log, &ls, &state.lightvisRaygenGroup));
 }
 
 // Pipeline
@@ -861,6 +874,13 @@ void createSBT(RendererState& state)
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_gather), sizeof(rgGather)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_gather),
         &rgGather, sizeof(rgGather), cudaMemcpyHostToDevice));
+
+    // Light visualization raygen SBT record
+    SbtRecord<RayGenData> rgLightvis = {};
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.lightvisRaygenGroup, &rgLightvis));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_lightvis), sizeof(rgLightvis)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_lightvis),
+        &rgLightvis, sizeof(rgLightvis), cudaMemcpyHostToDevice));
 }
 
 // OpenGL fullscreen quad
@@ -1175,6 +1195,70 @@ void launchPhotonGathering(RendererState& state, Params& p, CUstream& stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+void launchLightVis(RendererState& state, Params& p, CUstream stream,
+                    CUdeviceptr dLightvisBuf)
+{
+    // Очистить буфер сплэттинга
+    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(dLightvisBuf), 0,
+                               p.width * p.height * sizeof(float3), stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    p.lightvis_buffer = reinterpret_cast<float*>(dLightvisBuf);
+
+    // Сколько фотонов сохранено
+    int storedCount = 0;
+    CUDA_CHECK(cudaMemcpy(&storedCount, p.photon_count,
+                           sizeof(int), cudaMemcpyDeviceToHost));
+    storedCount = std::min(storedCount, p.num_photons);
+    if (storedCount == 0)
+        return;
+
+    // Загрузить обновлённые params (с новым cam_eye, lightvis_buffer)
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams),
+                           &p, sizeof(Params), cudaMemcpyHostToDevice));
+
+    // OptiX launch: 1-D, storedCount потоков
+    OptixShaderBindingTable sbtLV = state.sbt;
+    sbtLV.raygenRecord = state.drg_lightvis;
+
+    OPTIX_CHECK(optixLaunch(state.pipeline, stream,
+                             state.dParams, sizeof(Params),
+                             &sbtLV,
+                             (unsigned)storedCount, 1, 1));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Нормализация + gamma 2.0 + запись в frame_buffer (CPU-side)
+    std::vector<float3> hostBuf(p.width * p.height);
+    CUDA_CHECK(cudaMemcpy(hostBuf.data(),
+                           reinterpret_cast<void*>(dLightvisBuf),
+                           p.width * p.height * sizeof(float3),
+                           cudaMemcpyDeviceToHost));
+
+    // Авто-экспозиция по максимуму + ручной brightScale
+    float maxVal = 1e-10f;
+    for (const auto& v : hostBuf)
+        maxVal = std::max(maxVal, std::max(v.x, std::max(v.y, v.z)));
+
+    float invMax = p.photon_power_scale / maxVal;
+
+    std::vector<uchar4> hostFrame(p.width * p.height);
+    for (int i = 0; i < (int)(p.width * p.height); ++i) {
+        float r = sqrtf(std::min(hostBuf[i].x * invMax, 1.f));
+        float g = sqrtf(std::min(hostBuf[i].y * invMax, 1.f));
+        float b = sqrtf(std::min(hostBuf[i].z * invMax, 1.f));
+        hostFrame[i] = make_uchar4(
+            (unsigned char)(r * 255.f),
+            (unsigned char)(g * 255.f),
+            (unsigned char)(b * 255.f),
+            255u);
+    }
+
+    CUDA_CHECK(cudaMemcpy(p.frame_buffer,
+                           hostFrame.data(),
+                           p.width * p.height * sizeof(uchar4),
+                           cudaMemcpyHostToDevice));
+}
+
 static bool renderOffline(RendererState& state, Params& p, const std::string& outputFile)
 {
     const int W = static_cast<int>(p.width);
@@ -1201,7 +1285,7 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
         if (p.render_mode == 0) {
             // Path Tracing launch
             launchPathTracing(state, p, stream);
-        } else {
+        } else if (p.render_mode == 1) {
             // Photon Mapping launch
             if (!photons_valid) {
                 // Pass 1 — Photon tracing
@@ -1212,7 +1296,7 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
 
             // Pass 2 — Gathering
             launchPhotonGathering(state, p, stream);
-        }
+        } 
 
         p.frame_index++;
         std::cout << "\rOffline frame " << (f + 1) << "/" << p.offline_frames << std::flush;
@@ -1237,7 +1321,7 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUDA_CHECK(cudaFree(dFrame));
     CUDA_CHECK(cudaFree(dAccum));
-    
+
     return ok;
 }
 
@@ -1279,8 +1363,11 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     CUdeviceptr dAccum;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dAccum), W * H * sizeof(float3)));
     CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
-
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
+
+    CUdeviceptr dLightvisBuf = 0;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dLightvisBuf),
+                        W * H * sizeof(float3)));
 
     p.frame_index = 0;
 
@@ -1305,7 +1392,7 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         ImGui::Text("Frame: %u", p.frame_index);
 
         // Render mode
-        const char* renderModes[] = { "Path Tracing", "Photon Mapping" };
+        const char* renderModes[] = { "Path Tracing", "Photon Mapping", "Photon Tracing Only" };
         int renderMode = p.render_mode;
         if (ImGui::Combo("Render mode", &renderMode, renderModes, IM_ARRAYSIZE(renderModes))) {
             p.render_mode = renderMode;
@@ -1409,7 +1496,7 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         if (p.render_mode == 0) {
             // Path Tracing launch
             launchPathTracing(state, p, stream);
-        } else {
+        } else if (p.render_mode == 1) {
             // Photon Mapping launch
             if (!photons_valid) {
                 // Pass 1 — Photon tracing
@@ -1420,11 +1507,20 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
 
             // Pass 2 — Gathering
             launchPhotonGathering(state, p, stream);
+        } else if (p.render_mode == 2) {
+            // Only photon tracing, no gathering (to see photons in the scene)
+            // Pass 1 — Photon tracing
+            if (!photons_valid) {
+                launchPhotonTracing(state, p, stream);
+                
+                photons_valid = true;
+            }
+            // Pass 2 — Visualization
+            launchLightVis(state, p, stream, dLightvisBuf);
         }
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaPBO, stream));
         p.frame_index++;
-
         
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
         glBindTexture(GL_TEXTURE_2D, displayTex);
@@ -1488,7 +1584,7 @@ int main(int argc, char** argv) {
     // Build emissive light list
     buildLightList(scene, state);
 
-    p.num_photons = 100'000'000;
+    p.num_photons = 10'000'000;
     Photon* dPhotonMap;
     CUDA_CHECK(cudaMalloc(&dPhotonMap, p.num_photons * sizeof(Photon)));
     int* dPhotonCount;
