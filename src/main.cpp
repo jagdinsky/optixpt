@@ -55,6 +55,7 @@ static bool gFirstMouse = true;
 static float gYaw;
 static float gPitch;
 static bool gGuiMode = false;
+static constexpr size_t kMaxPhotonSlots = 32'000'000;   // 32M * 40B = 1.28 GB
 
 
 // Mouse callback to control camera orientation. Updates gYaw and gPitch based on mouse movement, and sets gCameraChanged to true when the camera is updated
@@ -312,6 +313,13 @@ struct RunArgs {
     std::string sceneFile = "scene.glb";
     bool offline = false;
     bool photon = false;
+    bool lightvis = false; // photon-tracing-only visualisation
+    int frames = 0; // 0 = keep the built-in default
+    int photonPaths = 0; // 0 = keep the built-in default
+    int maxDepth = 0; // 0 = keep the built-in default
+    int seed = 0; // random seed; same settings + different seed = independent run
+    float skyIntensity = -1.f; // <0 = keep the built-in default
+    int skyPhotons = -1; // <0 = keep the built-in default
     std::string cameraFile = "camera.txt";
     std::string outputFile = "../build/output.exr";
 };
@@ -325,11 +333,31 @@ static RunArgs parseArgs(int argc, char** argv) {
             args.offline = true;
         } else if (a == "--photon") {
             args.photon = true;
+        } else if (a == "--lightvis") {
+            args.lightvis = true;
+        } else if (a == "--frames" && i + 1 < argc) {
+            args.frames = std::max(1, atoi(argv[++i]));
+        } else if (a == "--paths" && i + 1 < argc) {
+            args.photonPaths = std::max(1, atoi(argv[++i]));
+        } else if (a == "--depth" && i + 1 < argc) {
+            args.maxDepth = std::max(1, atoi(argv[++i]));
+        } else if (a == "--seed" && i + 1 < argc) {
+            args.seed = atoi(argv[++i]);
+        } else if (a == "--sky" && i + 1 < argc) {
+            args.skyIntensity = (float)atof(argv[++i]);
+        } else if (a == "--sky-photons" && i + 1 < argc) {
+            args.skyPhotons = atoi(argv[++i]) ? 1 : 0;
         } else if (a == "--camera" && i + 1 < argc) {
             args.cameraFile = argv[++i];
         } else if (a == "--output" && i + 1 < argc) {
             args.outputFile = argv[++i];
-        } else if (!a.empty() && a[0] != '-') {
+        } else if (!a.empty() && a[0] == '-') {
+            std::cerr << "Unknown option: " << a << "\n"
+                      << "If this option was added recently, the binary is out "
+                         "of date — rebuild with:\n"
+                      << "    make -j$(nproc)\n";
+            std::exit(2);
+        } else if (!a.empty()) {
             args.sceneFile = a;
         }
     }
@@ -534,16 +562,109 @@ void buildLightList(const Scene& scene, RendererState& state)
         if (area < 1e-10f)
             continue;
 
+        float inv = 1.f / (2.f * area);
+        float3 gn = make_float3(cr.x * inv, cr.y * inv, cr.z * inv);
+
+        float3 sn = make_float3(tri.n0.x + tri.n1.x + tri.n2.x,
+                                tri.n0.y + tri.n1.y + tri.n2.y,
+                                tri.n0.z + tri.n1.z + tri.n2.z);
+        if (gn.x * sn.x + gn.y * sn.y + gn.z * sn.z < 0.f)
+            gn = make_float3(-gn.x, -gn.y, -gn.z);
+
         EmissiveTriangle lt;
         lt.v0 = tri.v0;
         lt.v1 = tri.v1;
         lt.v2 = tri.v2;
         lt.emission = em;
         lt.area = area;
+        lt.normal = gn;
         lt.tri_idx = i;
         state.hostLights.push_back(lt);
     }
     std::cout << "Light list: " << state.hostLights.size() << " emissive triangles.\n";
+}
+
+static float luminance(float3 c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; }
+
+// Scene bounding sphere.  It anchors the ray epsilon, gives the gather radius a
+// scene-relative default, and — most importantly — is the disc the environment
+// shoots its photons from.
+void computeSceneBounds(const Scene& scene, Params& p)
+{
+    if (scene.triangles.empty()) {
+        p.scene_center = make_float3(0.f, 0.f, 0.f);
+        p.scene_radius = 1.f;
+        p.scene_epsilon = 1e-3f;
+        return;
+    }
+
+    float3 bmin = scene.triangles[0].v0;
+    float3 bmax = bmin;
+    auto grow = [&](const float3& v) {
+        bmin.x = std::min(bmin.x, v.x);
+        bmax.x = std::max(bmax.x, v.x);
+        bmin.y = std::min(bmin.y, v.y);
+        bmax.y = std::max(bmax.y, v.y);
+        bmin.z = std::min(bmin.z, v.z);
+        bmax.z = std::max(bmax.z, v.z);
+    };
+    for (const auto& t : scene.triangles) {
+        grow(t.v0);
+        grow(t.v1);
+        grow(t.v2);
+    }
+
+    p.scene_center = make_float3(0.5f * (bmin.x + bmax.x),
+        0.5f * (bmin.y + bmax.y),
+        0.5f * (bmin.z + bmax.z));
+
+    float dx = bmax.x - bmin.x, dy = bmax.y - bmin.y, dz = bmax.z - bmin.z;
+    float diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    // 1% of slack keeps sky photons starting strictly outside the geometry.
+    p.scene_radius = std::max(0.5f * diag, 1e-4f) * 1.01f;
+    p.scene_epsilon = std::max(1e-4f, diag * 5e-5f);
+
+    std::cout << "Scene bounds: radius " << p.scene_radius
+              << ", epsilon " << p.scene_epsilon << "\n";
+}
+
+// Photon paths are split between the emissive triangles and the environment in
+// proportion to the flux each of them pushes into the scene, so neither emitter
+// ends up starved of photons.
+float computeSkySelectProb(const Params& p, const std::vector<EmissiveTriangle>& lights)
+{
+    float lightFlux = 0.f;
+    for (const auto& lt : lights)
+        lightFlux += luminance(lt.emission) * lt.area * RT_PI; // Φ = L·A·π
+
+    float skyFlux = 0.f;
+    if (p.emit_sky_photons && p.sky_intensity > 0.f && p.scene_radius > 0.f) {
+        // Φ_env = πR² ∫ L(ω) dω, integrated numerically over the sphere with
+        // cosθ stratified so the samples are uniform in solid angle.
+        const int NT = 64, NP = 128;
+        double sum = 0.0;
+        for (int i = 0; i < NT; ++i) {
+            double ct = 1.0 - 2.0 * (i + 0.5) / NT;
+            double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+            for (int j = 0; j < NP; ++j) {
+                double phi = 2.0 * M_PI * (j + 0.5) / NP;
+                float3 d = make_float3((float)(st * std::cos(phi)),
+                    (float)ct,
+                    (float)(st * std::sin(phi)));
+                sum += luminance(skyRadiance(d, p.sky_intensity));
+            }
+        }
+        double meanL = sum / double(NT * NP);
+        skyFlux = float(meanL * 4.0 * M_PI) * RT_PI * p.scene_radius * p.scene_radius;
+    }
+
+    if (skyFlux <= 0.f)
+        return 0.f;
+    if (lightFlux <= 0.f)
+        return 1.f;
+    // Never starve either emitter completely.
+    return std::min(0.9f, std::max(0.1f, skyFlux / (skyFlux + lightFlux)));
 }
 
 // GPU upload (scene data + light list)
@@ -740,13 +861,17 @@ void createProgramGroups(RendererState& state)
 // Pipeline
 void createPipeline(RendererState& state)
 {
+    // Every program group whose SBT record can be launched must be linked into
+    // the pipeline — __raygen__lightvis was missing here, so "Photon Tracing
+    // Only" was launching a record from an unlinked group.
     OptixProgramGroup groups[] = {
         state.raygenGroup,
         state.missGroup,
         state.shadowMissGroup,
         state.hitGroup,
         state.photonRaygenGroup,
-        state.gatherRaygenGroup
+        state.gatherRaygenGroup,
+        state.lightvisRaygenGroup
     };
 
     OptixPipelineLinkOptions lo = {};
@@ -771,6 +896,7 @@ void createPipeline(RendererState& state)
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.hitGroup, &ss, state.pipeline));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.photonRaygenGroup, &ss, state.pipeline));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.gatherRaygenGroup, &ss, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.lightvisRaygenGroup, &ss, state.pipeline));
 
     uint32_t fromTraversal, fromState, continuation;
     OPTIX_CHECK(optixUtilComputeStackSizes(
@@ -955,7 +1081,7 @@ void buildPhotonGrid(Params& params,
     int storedCount = 0;
     CUDA_CHECK(cudaMemcpy(&storedCount, params.photon_count,
         sizeof(int), cudaMemcpyDeviceToHost));
-    storedCount = std::min(storedCount, params.num_photons);
+    storedCount = std::min(storedCount, params.photon_capacity);
 
     if (storedCount == 0) {
         params.use_grid = 0;
@@ -1033,35 +1159,33 @@ void buildPhotonGrid(Params& params,
         gridPhotonIds[insertCursor[c]++] = i;
     }
 
-    // Upload to GPU
-    // Free previous buffers if they exist
-    if (dGridCellStart) {
-        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridCellStart)));
-        dGridCellStart = 0;
-    }
-    if (dGridCellCount) {
-        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridCellCount)));
-        dGridCellCount = 0;
-    }
-    if (dGridPhotonIds) {
-        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dGridPhotonIds)));
-        dGridPhotonIds = 0;
-    }
+    // Upload to GPU.  This runs once per frame now, so the buffers are kept
+    // and only grown when they no longer fit.
+    // One capacity per buffer — sharing a counter between two pointers would let
+    // the second one skip a realloc it actually needed.
+    static size_t startCapacity = 0;
+    static size_t countCapacity = 0;
+    static size_t idCapacity = 0;
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dGridCellStart),
-        totalCells * sizeof(int)));
+    auto ensure = [](CUdeviceptr& ptr, size_t& capacity, size_t needed) {
+        if (ptr && capacity >= needed)
+            return;
+        if (ptr)
+            CUDA_CHECK(cudaFree(reinterpret_cast<void*>(ptr)));
+        capacity = needed + needed / 4; // a little headroom
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr), capacity * sizeof(int)));
+    };
+
+    ensure(dGridCellStart, startCapacity, (size_t)totalCells);
+    ensure(dGridCellCount, countCapacity, (size_t)totalCells);
+    ensure(dGridPhotonIds, idCapacity, (size_t)storedCount);
+
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellStart),
         cellStart.data(), totalCells * sizeof(int),
         cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dGridCellCount),
-        totalCells * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellCount),
         cellCount.data(), totalCells * sizeof(int),
         cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dGridPhotonIds),
-        storedCount * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridPhotonIds),
         gridPhotonIds.data(), storedCount * sizeof(int),
         cudaMemcpyHostToDevice));
@@ -1155,32 +1279,79 @@ void launchPathTracing(RendererState& state, Params& p, CUstream& stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void launchPhotonTracing(RendererState& state, Params& p, CUstream& stream) {
-    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(p.photon_count),
-                              0, sizeof(int), stream));
+static bool tracePhotonsOnce(RendererState& state, Params& p, CUstream stream, int& deposits)
+{
+    CUDA_CHECK(cudaMemsetAsync(p.photon_count, 0, sizeof(int), stream));
 
     OptixShaderBindingTable sbtPhoton = state.sbt;
     sbtPhoton.raygenRecord = state.drg_photon;
 
-    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
-                              &p, sizeof(Params),
-                              cudaMemcpyHostToDevice, stream));
-    OPTIX_CHECK(optixLaunch(state.pipeline, stream,
-                            state.dParams, sizeof(Params),
-                            &sbtPhoton, p.num_photons, 1, 1));
-
-    buildPhotonGrid(p,
-                    state.dGridCellStart,
-                    state.dGridCellCount,
-                    state.dGridPhotonIds);
-
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams),
-                          &p,
-                          sizeof(Params),
-                          cudaMemcpyHostToDevice));
-
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params),
+                               cudaMemcpyHostToDevice, stream));
+    OPTIX_CHECK(optixLaunch(state.pipeline, stream, state.dParams, sizeof(Params),
+                            &sbtPhoton, (unsigned)p.num_photon_paths, 1, 1));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    CUDA_CHECK(cudaMemcpy(&deposits, p.photon_count, sizeof(int), cudaMemcpyDeviceToHost));
+    return deposits <= p.photon_capacity;
 }
+
+// Traces one full photon pass and rebuilds the lookup grid.
+// Returns the number of photons actually stored.
+int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream)
+{
+    int deposits = 0;
+    if (!tracePhotonsOnce(state, p, stream, deposits)) {
+        size_t need = size_t(deposits * 1.2) + 1024;
+        std::cout << "[Photons] saturated (" << deposits << " > " << p.photon_capacity
+                  << "), growing to " << need << " and retracing\n";
+
+        CUDA_CHECK(cudaFree(p.photon_map));
+        p.photon_capacity = int(std::min<size_t>(need, kMaxPhotonSlots));
+        CUDA_CHECK(cudaMalloc(&p.photon_map, size_t(p.photon_capacity) * sizeof(Photon)));
+
+        if (!tracePhotonsOnce(state, p, stream, deposits))
+            std::cerr << "[Photons] STILL saturated — lower num_photon_paths\n";
+    }
+    buildPhotonGrid(p, state.dGridCellStart, state.dGridCellCount, state.dGridPhotonIds);
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params),
+                          cudaMemcpyHostToDevice));
+    return std::min(deposits, p.photon_capacity);
+}
+
+// void launchPhotonTracing(RendererState& state, Params& p, CUstream& stream) {
+//     CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(p.photon_count),
+//                               0, sizeof(int), stream));
+
+//     OptixShaderBindingTable sbtPhoton = state.sbt;
+//     sbtPhoton.raygenRecord = state.drg_photon;
+
+//     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
+//                               &p, sizeof(Params),
+//                               cudaMemcpyHostToDevice, stream));
+//     OPTIX_CHECK(optixLaunch(state.pipeline, stream,
+//                             state.dParams, sizeof(Params),
+//                             &sbtPhoton, p.num_photon_paths, 1, 1));
+
+//     CUDA_CHECK(cudaStreamSynchronize(stream));     
+//     int deposits = 0;
+//     CUDA_CHECK(cudaMemcpy(&deposits, p.photon_count, sizeof(int), cudaMemcpyDeviceToHost));
+//     std::cout << "[Photons] " << p.num_photon_paths << " paths -> " << deposits
+//               << " deposits (" << double(deposits) / p.num_photon_paths
+//               << " per path)\n";
+
+//     buildPhotonGrid(p,
+//                     state.dGridCellStart,
+//                     state.dGridCellCount,
+//                     state.dGridPhotonIds);
+
+//     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams),
+//                           &p,
+//                           sizeof(Params),
+//                           cudaMemcpyHostToDevice));
+
+//     CUDA_CHECK(cudaStreamSynchronize(stream));
+// }
 
 void launchPhotonGathering(RendererState& state, Params& p, CUstream& stream) {
     OptixShaderBindingTable sbtGather = state.sbt;
@@ -1195,29 +1366,38 @@ void launchPhotonGathering(RendererState& state, Params& p, CUstream& stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+// Splats the photon map onto the film and tone-maps the result.
+//
+// The buffer accumulates across frames (it is only cleared on frame 0) so the
+// visualisation converges the same way the other two modes do — every pass
+// traces a fresh, independent photon map, and averaging them is what removes
+// the speckle.
 void launchLightVis(RendererState& state, Params& p, CUstream stream,
                     CUdeviceptr dLightvisBuf)
 {
-    // Очистить буфер сплэттинга
-    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(dLightvisBuf), 0,
-                               p.width * p.height * sizeof(float3), stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const size_t pixels = size_t(p.width) * size_t(p.height);
+
+    if (p.frame_index == 0) {
+        CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(dLightvisBuf), 0,
+                                   pixels * sizeof(float3), stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     p.lightvis_buffer = reinterpret_cast<float*>(dLightvisBuf);
 
-    // Сколько фотонов сохранено
+    // How many photons are stored
     int storedCount = 0;
     CUDA_CHECK(cudaMemcpy(&storedCount, p.photon_count,
                            sizeof(int), cudaMemcpyDeviceToHost));
-    storedCount = std::min(storedCount, p.num_photons);
+    storedCount = std::min(storedCount, p.photon_capacity);
     if (storedCount == 0)
         return;
 
-    // Загрузить обновлённые params (с новым cam_eye, lightvis_buffer)
+    // Upload updated params (with new cam_eye, lightvis_buffer)
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams),
                            &p, sizeof(Params), cudaMemcpyHostToDevice));
 
-    // OptiX launch: 1-D, storedCount потоков
+    // OptiX launch: 1-D, storedCount threads
     OptixShaderBindingTable sbtLV = state.sbt;
     sbtLV.raygenRecord = state.drg_lightvis;
 
@@ -1227,25 +1407,26 @@ void launchLightVis(RendererState& state, Params& p, CUstream stream,
                              (unsigned)storedCount, 1, 1));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Нормализация + gamma 2.0 + запись в frame_buffer (CPU-side)
-    std::vector<float3> hostBuf(p.width * p.height);
+    // Average over the passes so far, apply exposure, gamma 2.0.
+    //
+    // The old code divided by the brightest pixel in the image and then
+    // multiplied by photon_power_scale (15), which drove everything above 1/15
+    // of the maximum to pure white and made the visualisation independent of
+    // the actual photon intensities.  The kernel now emits real radiance, so it
+    // is tone-mapped exactly like the path-traced and photon-mapped images.
+    std::vector<float3> hostBuf(pixels);
     CUDA_CHECK(cudaMemcpy(hostBuf.data(),
                            reinterpret_cast<void*>(dLightvisBuf),
-                           p.width * p.height * sizeof(float3),
+                           pixels * sizeof(float3),
                            cudaMemcpyDeviceToHost));
 
-    // Авто-экспозиция по максимуму + ручной brightScale
-    float maxVal = 1e-10f;
-    for (const auto& v : hostBuf)
-        maxVal = std::max(maxVal, std::max(v.x, std::max(v.y, v.z)));
+    const float scale = p.lightvis_exposure / float(p.frame_index + 1);
 
-    float invMax = p.photon_power_scale / maxVal;
-
-    std::vector<uchar4> hostFrame(p.width * p.height);
-    for (int i = 0; i < (int)(p.width * p.height); ++i) {
-        float r = sqrtf(std::min(hostBuf[i].x * invMax, 1.f));
-        float g = sqrtf(std::min(hostBuf[i].y * invMax, 1.f));
-        float b = sqrtf(std::min(hostBuf[i].z * invMax, 1.f));
+    std::vector<uchar4> hostFrame(pixels);
+    for (size_t i = 0; i < pixels; ++i) {
+        float r = std::sqrt(std::min(std::max(hostBuf[i].x * scale, 0.f), 1.f));
+        float g = std::sqrt(std::min(std::max(hostBuf[i].y * scale, 0.f), 1.f));
+        float b = std::sqrt(std::min(std::max(hostBuf[i].z * scale, 0.f), 1.f));
         hostFrame[i] = make_uchar4(
             (unsigned char)(r * 255.f),
             (unsigned char)(g * 255.f),
@@ -1255,7 +1436,7 @@ void launchLightVis(RendererState& state, Params& p, CUstream stream,
 
     CUDA_CHECK(cudaMemcpy(p.frame_buffer,
                            hostFrame.data(),
-                           p.width * p.height * sizeof(uchar4),
+                           pixels * sizeof(uchar4),
                            cudaMemcpyHostToDevice));
 }
 
@@ -1274,11 +1455,13 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     CUstream stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
+    CUdeviceptr dLightvisBuf = 0;
+    if (p.render_mode == 2)
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dLightvisBuf), W * H * sizeof(float3)));
+
     p.frame_buffer = dFrame;
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
     p.frame_index  = 0;
-
-    bool photons_valid = false;
 
     for (int f = 0; f < p.offline_frames; ++f) {
 
@@ -1286,17 +1469,17 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
             // Path Tracing launch
             launchPathTracing(state, p, stream);
         } else if (p.render_mode == 1) {
-            // Photon Mapping launch
-            if (!photons_valid) {
-                // Pass 1 — Photon tracing
-                launchPhotonTracing(state, p, stream);
-
-                photons_valid = true;
-            }
+            // Pass 1 — Photon tracing.  A fresh map every frame: reusing one
+            // map would make every frame share the same density-estimate
+            // error, so the blotches would stay put no matter how long it ran.
+            launchPhotonTracing(state, p, stream);
 
             // Pass 2 — Gathering
             launchPhotonGathering(state, p, stream);
-        } 
+        } else if (p.render_mode == 2) {
+            launchPhotonTracing(state, p, stream);
+            launchLightVis(state, p, stream, dLightvisBuf);
+        }
 
         p.frame_index++;
         std::cout << "\rOffline frame " << (f + 1) << "/" << p.offline_frames << std::flush;
@@ -1304,16 +1487,33 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
 
     std::cout << "\n";
 
-    // Читаем accum_buffer и усредняем
     std::vector<float3> hostAccum(W * H);
-    CUDA_CHECK(cudaMemcpy(hostAccum.data(), dAccum,
-                          W * H * sizeof(float3), cudaMemcpyDeviceToHost));
-
     const float invF = 1.0f / float(p.offline_frames);
+
+    if (p.render_mode == 2) {
+        // The visualisation splats into its own buffer rather than accum_buffer.
+        CUDA_CHECK(cudaMemcpy(hostAccum.data(), reinterpret_cast<void*>(dLightvisBuf),
+                              W * H * sizeof(float3), cudaMemcpyDeviceToHost));
+        for (auto& c : hostAccum) {
+            c.x *= invF * p.lightvis_exposure;
+            c.y *= invF * p.lightvis_exposure;
+            c.z *= invF * p.lightvis_exposure;
+        }
+    } else {
+        // Read accum_buffer and average
+        CUDA_CHECK(cudaMemcpy(hostAccum.data(), dAccum,
+                              W * H * sizeof(float3), cudaMemcpyDeviceToHost));
+        for (auto& c : hostAccum) {
+            c.x *= invF;
+            c.y *= invF;
+            c.z *= invF;
+        }
+    }
+
     for (auto& c : hostAccum) {
-        c.x *= invF; if (!std::isfinite(c.x)) c.x = 0.f;
-        c.y *= invF; if (!std::isfinite(c.y)) c.y = 0.f;
-        c.z *= invF; if (!std::isfinite(c.z)) c.z = 0.f;
+        if (!std::isfinite(c.x)) c.x = 0.f;
+        if (!std::isfinite(c.y)) c.y = 0.f;
+        if (!std::isfinite(c.z)) c.z = 0.f;
     }
 
     bool ok = saveEXR(outputFile, hostAccum, W, H);
@@ -1321,6 +1521,8 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUDA_CHECK(cudaFree(dFrame));
     CUDA_CHECK(cudaFree(dAccum));
+    if (dLightvisBuf)
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dLightvisBuf)));
 
     return ok;
 }
@@ -1375,6 +1577,8 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     bool photons_valid = false;
+    bool retracePhotons = true; // a fresh map per frame is what makes it converge
+    int lastDeposits = 0;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -1383,9 +1587,11 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Renderer");
+        ImGui::Begin("Renderer (F1 to toggle GUI mode)");
 
         bool resetAccum = false;
+        bool resetPhotons = false;
+        bool skyChanged = false;
 
         ImGui::Text("F1 - Toggle GUI mode");
         ImGui::Text("ESC - Exit app");
@@ -1399,22 +1605,116 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             resetAccum = true;
         }
 
+        if (ImGui::CollapsingHeader("Sampling")) {
+            if (ImGui::SliderInt("Samples / pixel", &p.samples_per_pixel, 1, 16))
+                resetAccum = true;
+            if (ImGui::SliderInt("Max depth", &p.max_depth, 1, 16)) {
+                resetAccum = true;
+                resetPhotons = true;
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Lighting")) {
+            if (ImGui::SliderFloat("Sky intensity", &p.sky_intensity, 0.f, 4.f, "%.2f")) {
+                resetAccum = true;
+                resetPhotons = true;
+                skyChanged = true;
+            }
+            bool skyPhotons = p.emit_sky_photons != 0;
+            if (ImGui::Checkbox("Sky emits photons", &skyPhotons)) {
+                p.emit_sky_photons = skyPhotons ? 1 : 0;
+                resetAccum = true;
+                resetPhotons = true;
+                skyChanged = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(photon mapping only)");
+            // Say plainly when the control cannot do anything, rather than
+            // leaving it looking broken: it is inert in path-tracing mode, and
+            // inert again when the sky is off or cannot reach the scene.
+            if (p.render_mode == 0)
+                ImGui::TextDisabled("  no effect in Path Tracing mode");
+            else if (p.sky_intensity <= 0.f)
+                ImGui::TextDisabled("  no effect while Sky intensity is 0");
+            else if (p.emit_sky_photons && p.sky_select_prob <= 0.f)
+                ImGui::TextDisabled("  sky carries no flux in this scene");
+            ImGui::Text("Photon paths from sky: %.0f%%  (0%% = area lights only)",
+                100.0 * p.sky_select_prob);
+        }
+
+        if (p.render_mode != 0 && ImGui::CollapsingHeader("Photon map", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::SliderInt("Paths / pass", &p.num_photon_paths, 50'000, 4'000'000)) {
+                resetAccum = true;
+                resetPhotons = true;
+            }
+            ImGui::Text("Stored: %d / %d", lastDeposits, p.photon_capacity);
+
+            float rMin = 0.001f * p.scene_radius;
+            float rMax = 0.200f * p.scene_radius;
+            if (ImGui::SliderFloat("Gather radius", &p.gather_radius, rMin, rMax, "%.4f")) {
+                resetAccum = true;
+                resetPhotons = true; // the grid is binned at this radius
+            }
+
+            bool adaptive = p.adaptive_radius != 0;
+            if (ImGui::Checkbox("Adaptive radius", &adaptive)) {
+                p.adaptive_radius = adaptive ? 1 : 0;
+                resetAccum = true;
+            }
+            if (adaptive) {
+                if (ImGui::SliderInt("Target photons", &p.target_photons, 8, 512))
+                    resetAccum = true;
+            }
+
+            if (ImGui::SliderFloat("Plane tolerance", &p.photon_plane_tol, 0.01f, 1.0f, "%.3f"))
+                resetAccum = true;
+            if (ImGui::SliderFloat("Normal tolerance", &p.photon_normal_tol, -1.0f, 0.99f, "%.3f"))
+                resetAccum = true;
+
+            bool storeDirect = p.store_direct_photons != 0;
+            if (ImGui::Checkbox("Direct light from photons", &storeDirect)) {
+                p.store_direct_photons = storeDirect ? 1 : 0;
+                resetAccum = true;
+                resetPhotons = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(off = shadow rays, much quieter)");
+
+            if (ImGui::SliderFloat("Power scale", &p.photon_power_scale, 0.1f, 10.f, "%.2f")) {
+                resetAccum = true;
+                resetPhotons = true;
+            }
+
+            ImGui::Checkbox("Retrace every frame", &retracePhotons);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(off = noise stops converging)");
+        }
+
+        if (p.render_mode == 2 && ImGui::CollapsingHeader("Photon visualisation", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::SliderFloat("Exposure", &p.lightvis_exposure, 0.01f, 20.f, "%.2f", ImGuiSliderFlags_Logarithmic))
+                resetAccum = true;
+            if (ImGui::SliderInt("Splat radius (px)", &p.lightvis_splat_px, 0, 4))
+                resetAccum = true;
+        }
+
         // Camera position
         bool cameraEdited = false;
-        float camPos[3] = { p.cam_eye.x, p.cam_eye.y, p.cam_eye.z };
-        if (ImGui::InputFloat3("Camera position", camPos, "%.3f")) {
-            p.cam_eye = make_float3(camPos[0], camPos[1], camPos[2]);
-            cameraEdited = true;
-        }
-        float yaw = gYaw;
-        if (ImGui::InputFloat("Yaw", &yaw, 0.5f, 5.0f, "%.3f")) {
-            gYaw = yaw;
-            cameraEdited = true;
-        }
-        float pitch = gPitch;
-        if (ImGui::SliderFloat("Pitch", &pitch, -89.0f, 89.0f, "%.3f")) {
-            gPitch = pitch;
-            cameraEdited = true;
+        if (ImGui::CollapsingHeader("Camera")) {
+            float camPos[3] = { p.cam_eye.x, p.cam_eye.y, p.cam_eye.z };
+            if (ImGui::InputFloat3("Camera position", camPos, "%.3f")) {
+                p.cam_eye = make_float3(camPos[0], camPos[1], camPos[2]);
+                cameraEdited = true;
+            }
+            float yaw = gYaw;
+            if (ImGui::InputFloat("Yaw", &yaw, 0.5f, 5.0f, "%.3f")) {
+                gYaw = yaw;
+                cameraEdited = true;
+            }
+            float pitch = gPitch;
+            if (ImGui::SliderFloat("Pitch", &pitch, -89.0f, 89.0f, "%.3f")) {
+                gPitch = pitch;
+                cameraEdited = true;
+            }
         }
 
         ImGui::End();
@@ -1426,10 +1726,15 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             gCameraChanged = false;
         }
 
+        if (skyChanged)
+            p.sky_select_prob = computeSkySelectProb(p, state.hostLights);
+
+        if (resetPhotons)
+            photons_valid = false;
+
         if (resetAccum) {
             p.frame_index = 0;
             CUDA_CHECK(cudaMemset(reinterpret_cast<void*>(dAccum), 0, W * H * sizeof(float3)));
-            // photons_valid = false;
         }
 
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
@@ -1496,27 +1801,22 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         if (p.render_mode == 0) {
             // Path Tracing launch
             launchPathTracing(state, p, stream);
-        } else if (p.render_mode == 1) {
-            // Photon Mapping launch
-            if (!photons_valid) {
-                // Pass 1 — Photon tracing
-                launchPhotonTracing(state, p, stream);
-                    
+        } else {
+            // Pass 1 — Photon tracing.  Re-traced every frame by default: the
+            // accumulation buffer can only average away photon noise if each
+            // frame sees an *independent* photon map.  Holding one map fixed
+            // (as this used to) freezes its density-estimate error into the
+            // image, which is what left the permanent blotches.
+            if (retracePhotons || !photons_valid) {
+                lastDeposits = launchPhotonTracing(state, p, stream);
                 photons_valid = true;
             }
 
-            // Pass 2 — Gathering
-            launchPhotonGathering(state, p, stream);
-        } else if (p.render_mode == 2) {
-            // Only photon tracing, no gathering (to see photons in the scene)
-            // Pass 1 — Photon tracing
-            if (!photons_valid) {
-                launchPhotonTracing(state, p, stream);
-                
-                photons_valid = true;
-            }
-            // Pass 2 — Visualization
-            launchLightVis(state, p, stream, dLightvisBuf);
+            // Pass 2 — Gathering, or splatting the map straight onto the film
+            if (p.render_mode == 1)
+                launchPhotonGathering(state, p, stream);
+            else
+                launchLightVis(state, p, stream, dLightvisBuf);
         }
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaPBO, stream));
@@ -1584,24 +1884,66 @@ int main(int argc, char** argv) {
     // Build emissive light list
     buildLightList(scene, state);
 
-    p.num_photons = 10'000'000;
-    Photon* dPhotonMap;
-    CUDA_CHECK(cudaMalloc(&dPhotonMap, p.num_photons * sizeof(Photon)));
-    int* dPhotonCount;
-    CUDA_CHECK(cudaMalloc(&dPhotonCount, sizeof(int)));
-    CUDA_CHECK(cudaMemset(dPhotonCount, 0, sizeof(int)));
-    
+    // Needed before the photon defaults below: they are scene-relative.
+    computeSceneBounds(scene, p);
+
+    // Photons are re-traced every frame now, so a pass is sized for one frame
+    // rather than for the whole render; the frames average together.
+    p.num_photon_paths = 400'000;
+    p.photon_capacity = 4'000'000;
+    CUDA_CHECK(cudaMalloc(&p.photon_map, size_t(p.photon_capacity) * sizeof(Photon)));
+    CUDA_CHECK(cudaMalloc(&p.photon_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(p.photon_count, 0, sizeof(int)));
+
     p.offline_frames = 8; // number of frames to render in offline mode
-    p.photon_map = dPhotonMap;
-    p.photon_count = dPhotonCount;
-    p.gather_radius = 1.0f; // tune for the scene
-    p.photon_power_scale = 50.0f; // tune for the scene
     p.samples_per_pixel = 4;
     p.max_depth         = 8;
+    p.seed              = 0; // --seed overrides; 0 keeps every run reproducible
+
+    // Gather radius as a fraction of the scene, not an absolute 1.0 — a radius
+    // that happens to be hucdge for the scene is exactly what smears the photon
+    // estimate into big soft stains.
+    p.gather_radius = 0.03f * p.scene_radius;
+    p.adaptive_radius = 1;
+    p.target_photons = 64;
+    p.photon_plane_tol = 0.20f; // |offset along n| <= 20% of the radius
+    p.photon_normal_tol = 0.70f; // ~45 degrees of normal agreement
+    p.store_direct_photons = 0; // direct light comes from shadow rays instead
+    p.photon_power_scale = 1.0f; // physically correct; not a brightness fudge
+
+    // The sky was already lighting the path-traced image through the miss
+    // shader; now the photon pass emits it too, so both modes agree.
+    // Sky off by default.  With it on, the two modes reach it by different
+    // routes — the path tracer through the miss shader on every escaping
+    // continuation ray, photon mapping through an analytic term plus emitted
+    // sky photons — and unless emit_sky_photons is also on they are not even
+    // integrating the same light.  Turning it off removes that asymmetry
+    // entirely; --sky turns it back on when you want to exercise it.
+    p.sky_intensity = 0.0f;
+    p.emit_sky_photons = 0; // without this photon mapping gets no indirect sky
+
+    p.lightvis_exposure = 1.0f;
+    p.lightvis_splat_px = 1;
+
     p.render_mode = 0; // start with path tracing by default
     if (args.photon) {
         p.render_mode = 1; // start with photon mapping
     }
+    if (args.lightvis) {
+        p.render_mode = 2; // photon tracing only (visualise the map)
+    }
+
+    if (args.frames > 0)
+        p.offline_frames = args.frames;
+    if (args.photonPaths > 0)
+        p.num_photon_paths = args.photonPaths;
+    if (args.maxDepth > 0)
+        p.max_depth = args.maxDepth;
+    p.seed = args.seed;
+    if (args.skyIntensity >= 0.f)
+        p.sky_intensity = args.skyIntensity;
+    if (args.skyPhotons >= 0)
+        p.emit_sky_photons = args.skyPhotons;
 
     uploadSceneBuffers(scene, state);
 
@@ -1624,7 +1966,13 @@ int main(int argc, char** argv) {
     p.total_light_area = 0.f;
     for (const auto& lt : state.hostLights)
         p.total_light_area += lt.area;
-    
+
+    // How to split photon paths between the emissive triangles and the sky.
+    p.sky_select_prob = computeSkySelectProb(p, state.hostLights);
+    std::cout << "Photon path split: " << int(100.f * p.sky_select_prob)
+              << "% sky / " << int(100.f * (1.f - p.sky_select_prob)) << "% area lights\n";
+
+
     if(args.offline) {
         if (!renderOffline(state, p, args.outputFile)) {
             std::cerr << "Offline rendering failed.\n";
@@ -1638,8 +1986,8 @@ int main(int argc, char** argv) {
     }
 
     // Cleanups
-    cudaFree(dPhotonMap);
-    cudaFree(dPhotonCount);
+    cudaFree(p.photon_map);
+    cudaFree(p.photon_count);
     cudaFree(reinterpret_cast<void*>(state.dParams));
     if (state.dLights)
         cudaFree(reinterpret_cast<void*>(state.dLights));

@@ -48,30 +48,56 @@ __device__ __forceinline__ float3 sampleTexSRGB(cudaTextureObject_t tex,
         srgbToLinear(s.z));
 }
 
-// grid cell lookup
-__device__ __forceinline__ int gridCellFlat(const PhotonGrid& g, float3 p)
+// Decides whether a stored photon may contribute to the estimate at `x`.
+// The plain 3D distance test is not enough: a sphere of radius r around a point
+// near a corner also encloses photons that landed on the *neighbouring* wall,
+// and those are what leak across edges and show up as blotches.  Requiring the
+// photon to sit near the tangent plane turns the sphere into a thin disc, and
+// requiring a matching normal keeps the two sides of a thin wall apart.
+__device__ __forceinline__ bool photonUsable(const Photon& ph, float3 x, float3 n,
+    float r2, float planeTol, float normalTol, int maxPhotonDepth, float& d2)
 {
-    int ix = (int)floorf((p.x - g.aabb_min.x) / g.cell_size);
-    int iy = (int)floorf((p.y - g.aabb_min.y) / g.cell_size);
-    int iz = (int)floorf((p.z - g.aabb_min.z) / g.cell_size);
-    // clamp to valid range
-    ix = max(0, min(ix, g.dims.x - 1));
-    iy = max(0, min(iy, g.dims.y - 1));
-    iz = max(0, min(iz, g.dims.z - 1));
-    return iz * g.dims.y * g.dims.x + iy * g.dims.x + ix;
+    // Path length first, because it is the cheapest test and because getting it
+    // wrong is not a matter of a few stray photons: without it the camera walk
+    // and the photon walk each get their own max_depth, so photon mapping
+    // integrates paths up to twice as long as the path tracer does and the two
+    // modes stop solving the same problem.  See __raygen__gather for the budget.
+    if (ph.depth > maxPhotonDepth)
+        return false;
+    float3 diff = ph.pos - x;
+    d2 = dot(diff, diff);
+    if (d2 > r2)
+        return false;
+    if (dot(n, ph.normal) < normalTol)
+        return false;
+    if (fabsf(dot(diff, n)) > planeTol)
+        return false;
+    // The photon must have arrived on the side we are shading.
+    if (dot(n, ph.dir) <= 1e-4f)
+        return false;
+    return true;
 }
-__device__ float3 gatherPhotonsGrid(float3 hitpos, float3 n,
-    float r, float r2)
+
+// Cone-filtered flux within `r`, and how many photons contributed.  The count
+// is what lets the caller adapt the radius to the local photon density.
+__device__ void gatherPhotonsGrid(float3 hitpos, float3 n, float r, float r2,
+    int maxPhotonDepth, float3& flux, int& count)
 {
     const PhotonGrid& g = params.grid;
-    float3 irradiance = make_float3(0.f, 0.f, 0.f);
+    flux = make_float3(0.f, 0.f, 0.f);
+    count = 0;
+
+    const float planeTol = params.photon_plane_tol * r;
+    const float normalTol = params.photon_normal_tol;
+    const float invR = 1.f / r;
 
     // hitpos in grid coordinates
     int cx = (int)floorf((hitpos.x - g.aabb_min.x) / g.cell_size);
     int cy = (int)floorf((hitpos.y - g.aabb_min.y) / g.cell_size);
     int cz = (int)floorf((hitpos.z - g.aabb_min.z) / g.cell_size);
 
-    // go over neighboring cells (3x3x3)
+    // go over neighboring cells (3x3x3); cell_size is the maximum gather
+    // radius, so this neighbourhood always covers the search sphere
     for (int dz = -1; dz <= 1; ++dz) {
         int nz = cz + dz;
         if (nz < 0 || nz >= g.dims.z)
@@ -87,52 +113,91 @@ __device__ float3 gatherPhotonsGrid(float3 hitpos, float3 n,
 
                 int cell = nz * g.dims.y * g.dims.x + ny * g.dims.x + nx;
                 int start = g.cell_start[cell];
-                int count = g.cell_count[cell];
+                int cellCount = g.cell_count[cell];
 
-                for (int k = 0; k < count; ++k) {
+                for (int k = 0; k < cellCount; ++k) {
                     int pid = g.grid_photon_ids[start + k];
                     const Photon& ph = params.photon_map[pid];
 
-                    float3 diff = ph.pos - hitpos;
-                    float d2 = dot(diff, diff);
-                    if (d2 > r2)
+                    float d2;
+                    if (!photonUsable(ph, hitpos, n, r2, planeTol, normalTol,
+                            maxPhotonDepth, d2))
                         continue;
 
-                    float cosCheck = dot(n, ph.dir);
-                    if (cosCheck < 1e-3f)
-                        continue;
-
-                    float dist = sqrtf(d2);
-                    float weight = 1.f - dist / r; // cone filter k=1
-                    irradiance += weight * ph.power;
+                    float weight = 1.f - sqrtf(d2) * invR; // cone filter k=1
+                    flux += weight * ph.power;
+                    ++count;
                 }
             }
         }
     }
-    return irradiance;
 }
-__device__ float3 gatherBruteForce(float3 hitpos, float3 n,
-    float r, float r2)
-{
-    float3 irradiance = make_float3(0.f, 0.f, 0.f);
-    int stored = min(*params.photon_count, params.num_photons);
 
+__device__ void gatherBruteForce(float3 hitpos, float3 n, float r, float r2,
+    int maxPhotonDepth, float3& flux, int& count)
+{
+    flux = make_float3(0.f, 0.f, 0.f);
+    count = 0;
+
+    const float planeTol = params.photon_plane_tol * r;
+    const float normalTol = params.photon_normal_tol;
+    const float invR = 1.f / r;
+
+    int stored = min(*params.photon_count, params.photon_capacity);
     for (int i = 0; i < stored; i++) {
         const Photon& ph = params.photon_map[i];
-        float3 diff = ph.pos - hitpos;
-        float d2 = dot(diff, diff);
-        if (d2 > r2)
+
+        float d2;
+        if (!photonUsable(ph, hitpos, n, r2, planeTol, normalTol,
+                maxPhotonDepth, d2))
             continue;
 
-        float cosCheck = dot(n, ph.dir);
-        if (cosCheck < 1e-3f)
-            continue;
-
-        float dist = sqrtf(d2);
-        float weight = 1.f - dist / r;
-        irradiance += weight * ph.power;
+        float weight = 1.f - sqrtf(d2) * invR;
+        flux += weight * ph.power;
+        ++count;
     }
-    return irradiance;
+}
+
+__device__ __forceinline__ void gatherPhotons(float3 hitpos, float3 n,
+    float r, float r2, int maxPhotonDepth, float3& flux, int& count)
+{
+    if (params.use_grid)
+        gatherPhotonsGrid(hitpos, n, r, r2, maxPhotonDepth, flux, count);
+    else
+        gatherBruteForce(hitpos, n, r, r2, maxPhotonDepth, flux, count);
+}
+
+// Irradiance from the photon map at a surface point.
+//
+// The cone filter w(d) = 1 - d/r integrates to  ∫(1 - d/r) dA = π r² / 3  over
+// the disc, so the density estimate is  E = 3 Σ w Φ / (π r²).
+//
+// With a single fixed radius the estimate is either too noisy (sparse regions)
+// or too blurry (dense ones) — the "big stains".  Probing the density at the
+// maximum radius first and then shrinking towards `target_photons` (photon
+// count grows with r², hence the sqrt) keeps well-lit regions sharp without
+// starving the dark ones.
+__device__ float3 photonIrradiance(float3 hitpos, float3 n, int maxPhotonDepth,
+    float& usedRadius)
+{
+    float r = params.gather_radius;
+    float r2 = r * r;
+    float3 flux;
+    int count;
+
+    gatherPhotons(hitpos, n, r, r2, maxPhotonDepth, flux, count);
+
+    if (params.adaptive_radius && params.target_photons > 0 && count > params.target_photons) {
+        float scale = sqrtf((float)params.target_photons / (float)count);
+        r *= fmaxf(scale, 0.05f);
+        r2 = r * r;
+        gatherPhotons(hitpos, n, r, r2, maxPhotonDepth, flux, count);
+    }
+
+    usedRadius = r;
+    if (count == 0)
+        return make_float3(0.f, 0.f, 0.f);
+    return flux * (3.f / (M_PIf * r2));
 }
 
 // SBT structs
@@ -150,6 +215,54 @@ __device__ unsigned int pcg(unsigned int& s)
 }
 __device__ float randf(unsigned int& rng) { return (pcg(rng) & 0xFFFFFF) / float(0x1000000); }
 
+// Seed mixer. Paths are seeded from (launch index, frame index); feeding those
+// in as a plain linear combination leaves neighbouring samples visibly
+// correlated, so both are avalanched first.
+__device__ __forceinline__ unsigned int hashSeed(unsigned int a, unsigned int b)
+{
+    unsigned int s = a * 0x9E3779B1u + b * 0x85EBCA6Bu + 0x165667B1u;
+    s ^= s >> 16;
+    s *= 0x7FEB352Du;
+    s ^= s >> 15;
+    s *= 0x846CA68Bu;
+    s ^= s >> 16;
+    return s;
+}
+
+// Every kernel draws from its own stream, and every run can be given its own
+// seed.  Both matter beyond tidiness:
+//
+//   * the stream constants keep the path tracer and the gather off each other's
+//     random numbers.  Sharing one — which is what the old
+//     `pixel*1973 + frame*9277 + 4801` did in both kernels — makes the two
+//     images share their noise, so the difference between them comes out
+//     smaller than it should and a comparison of the two modes flatters photon
+//     mapping.
+//   * params.seed leaves the renderer reproducible by default (seed 0) while
+//     letting two runs of the *same* settings be made genuinely independent,
+//     which is what proof.py needs to measure how noisy a render is without
+//     any assumption about how the runs relate.
+//
+// Note that the stream still depends only on (index, frame, seed), so frame i
+// is the same frame in an 8-frame and a 128-frame run: short runs remain
+// prefixes of long ones.
+#define RNG_STREAM_PATH 0x9E3779B9u
+#define RNG_STREAM_GATHER 0xBB67AE85u
+#define RNG_STREAM_PHOTON 0x3C6EF372u
+
+__device__ __forceinline__ unsigned int hashSeed3(unsigned int a, unsigned int b,
+    unsigned int c)
+{
+    unsigned int s = a * 0x9E3779B1u + b * 0x85EBCA6Bu + c * 0xC2B2AE35u
+        + 0x165667B1u;
+    s ^= s >> 16;
+    s *= 0x7FEB352Du;
+    s ^= s >> 15;
+    s *= 0x846CA68Bu;
+    s ^= s >> 16;
+    return s;
+}
+
 // Cosine-weighted hemisphere sample
 __device__ float3 cosineSampleHemisphere(float r1, float r2)
 {
@@ -157,6 +270,34 @@ __device__ float3 cosineSampleHemisphere(float r1, float r2)
     return make_float3(cosf(phi) * s, sinf(phi) * s, sqrtf(1.f - r2));
 }
 __device__ __forceinline__ float pdfCosineHemisphere(float cosT) { return fmaxf(cosT, 0.f) * M_1_PIf; }
+
+// Uniform direction on the sphere (pdf = 1/4π) — the emission distribution for
+// environment photons.
+__device__ float3 uniformSampleSphere(float r1, float r2)
+{
+    float z = 1.f - 2.f * r1;
+    float s = sqrtf(fmaxf(0.f, 1.f - z * z));
+    float phi = 2.f * M_PIf * r2;
+    return make_float3(s * cosf(phi), s * sinf(phi), z);
+}
+
+// Uniform point on the unit disc (concentric mapping — no clustering at the
+// centre like the naive sqrt(r),θ parameterisation).
+__device__ float2 concentricSampleDisk(float r1, float r2)
+{
+    float ox = 2.f * r1 - 1.f, oy = 2.f * r2 - 1.f;
+    if (ox == 0.f && oy == 0.f)
+        return make_float2(0.f, 0.f);
+    float r, theta;
+    if (fabsf(ox) > fabsf(oy)) {
+        r = ox;
+        theta = (M_PIf * 0.25f) * (oy / ox);
+    } else {
+        r = oy;
+        theta = (M_PIf * 0.5f) - (M_PIf * 0.25f) * (ox / oy);
+    }
+    return make_float2(r * cosf(theta), r * sinf(theta));
+}
 
 // ONB
 __device__ void onb(const float3& n, float3& t, float3& b)
@@ -174,6 +315,38 @@ __device__ float schlick(float cosTheta, float ior)
     r0 *= r0;
     return r0 + (1.f - r0) * powf(1.f - cosTheta, 5.f);
 }
+
+// Non-symmetric scattering and refraction.
+//
+// Refraction is the one interaction here that is not reciprocal.  Snell's law
+// compresses the transmitted cone, and conserving the power in the beam then
+// forces
+//
+//     L_t = L_i * (n_t / n_i)^2,
+//
+// so radiance jumps by n^2 on the way into a denser medium and drops by n^2 on
+// the way out — L/n^2 is what is actually invariant along a ray.  Photon power
+// is flux, and flux crosses the interface untouched.  Which BTDF a walk must
+// use therefore depends on the quantity it carries: f_t(wi -> wo) and
+// f_t(wo -> wi) differ by exactly that n^2, so a light-side walk uses the
+// adjoint of the BSDF a camera-side walk uses.  pbrt 4th ed., 9.5.2
+// "Non-Symmetric Scattering and Refraction".
+//
+// For this file it comes down to one rule, with `eta` below already being
+// n_i/n_t:
+//
+//   * camera-side walks (__raygen__rg, __raygen__gather) carry radiance, and
+//     multiply their throughput by eta*eta on every transmission;
+//   * __raygen__photon carries power, and multiplies by nothing.
+//
+// Omitting it in all three passes looks harmless, because along a path that
+// enters the glass and leaves it again the two factors are reciprocal and
+// cancel.  They stop cancelling the moment a path ends inside the medium — a
+// diffuse surface in contact with, or sunk into, the glass — where the camera
+// walk crosses the boundary an odd number of times.  Photon mapping joins its
+// two half-paths exactly at such a vertex, so it was reading n^2 = 2.25 too
+// bright on the floor under the glass box, while path tracing kept both of its
+// endpoints in air and never noticed.
 
 // Safe refract — returns false on total internal reflection
 __device__ bool refractDir(float3 d, float3 n, float eta, float3& refracted)
@@ -202,20 +375,33 @@ __device__ float3 sampleTriangle(float3 v0, float3 v1, float3 v2, float r1, floa
     return u * v0 + v * v1 + (1.f - u - v) * v2;
 }
 
-// Shadow ray (ray type 1)
-__device__ bool isVisible(float3 origin, float3 target)
+// Shadow ray (ray type 1).  Only __miss__shadow runs, and it sets payload 0 to
+// 1, so a payload that stays 0 means something was hit.
+__device__ bool unoccluded(float3 origin, float3 dir, float tmax)
 {
-    float3 d = target - origin;
-    float tmax = length(d) - 2e-3f;
-    if (tmax <= 0.f)
+    if (tmax <= params.scene_epsilon)
         return false;
-    d = normalize(d);
     unsigned int vis = 0u;
-    optixTrace(params.handle, origin, d, 1e-3f, tmax, 0.f,
+    optixTrace(params.handle, origin, dir, params.scene_epsilon, tmax, 0.f,
         OptixVisibilityMask(255),
         OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
         0, 1, 1, vis);
     return (vis == 1u);
+}
+
+__device__ __forceinline__ bool isVisible(float3 origin, float3 target)
+{
+    float3 d = target - origin;
+    float dist = length(d);
+    if (dist <= 2.f * params.scene_epsilon)
+        return false;
+    return unoccluded(origin, d * (1.f / dist), dist - 2.f * params.scene_epsilon);
+}
+
+// Does `dir` escape the scene and reach the sky?
+__device__ __forceinline__ bool reachesSky(float3 origin, float3 dir)
+{
+    return unoccluded(origin, dir, 1e16f);
 }
 
 // MIS power heuristic (β=2)
@@ -223,6 +409,52 @@ __device__ __forceinline__ float misWeight(float pdfA, float pdfB)
 {
     float a2 = pdfA * pdfA, b2 = pdfB * pdfB;
     return a2 / fmaxf(a2 + b2, 1e-10f);
+}
+
+// Direct illumination on a Lambertian surface, by next-event estimation.
+//
+// Photon mapping *can* deliver this term straight from the map, but a density
+// estimate of the first bounce is exactly where the estimator is worst: right
+// at a shadow boundary the disc straddles lit and unlit surface, which is what
+// paints the soft blotches over every shadow.  Two shadow rays are far cheaper
+// and far quieter, and they leave the photon map to do what it is good at —
+// indirect light and caustics.
+__device__ float3 directLighting(float3 x, float3 n, float3 albedo, unsigned int& rng)
+{
+    float3 L = make_float3(0.f, 0.f, 0.f);
+    const float3 org = x + params.scene_epsilon * n;
+
+    // Emissive triangles: pick one uniformly, then a uniform point on it.
+    if (params.num_lights > 0) {
+        int lIdx = min((int)(randf(rng) * params.num_lights), params.num_lights - 1);
+        const EmissiveTriangle& lt = params.lights[lIdx];
+
+        float3 lp = sampleTriangle(lt.v0, lt.v1, lt.v2, randf(rng), randf(rng));
+        float3 toLight = lp - x;
+        float dist2 = dot(toLight, toLight);
+        float dist = sqrtf(dist2);
+        float3 wi = toLight * (1.f / dist);
+        float cosN = dot(n, wi);
+        float cosLight = -dot(lt.normal, wi);
+
+        if (cosN > 0.f && cosLight > 1e-4f && isVisible(org, lp)) {
+            // area pdf -> solid angle pdf
+            float pLightSA = (dist2 / cosLight) / (params.num_lights * lt.area);
+            L += albedo * M_1_PIf * lt.emission * cosN * (1.f / pLightSA);
+        }
+    }
+
+    // Environment: a cosine-weighted direction, whose pdf cancels the BRDF's
+    // cosine exactly, leaving just albedo * sky.
+    if (params.sky_intensity > 0.f) {
+        float3 t, b;
+        onb(n, t, b);
+        float3 wi = normalize(toWorld(cosineSampleHemisphere(randf(rng), randf(rng)), n, t, b));
+        if (reachesSky(org, wi))
+            L += albedo * skyRadiance(wi, params.sky_intensity);
+    }
+
+    return L;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +479,8 @@ extern "C" __global__ void __raygen__rg()
     const uint3 idx = optixGetLaunchIndex();
     const int pixel = idx.y * params.width + idx.x;
 
-    unsigned int rng = pixel * 1973u + (unsigned int)(params.frame_index) * 9277u + 4801u;
+    unsigned int rng = hashSeed3(pixel, (unsigned int)params.frame_index,
+        (unsigned int)params.seed ^ RNG_STREAM_PATH);
 
     float3 result = make_float3(0.f, 0.f, 0.f);
 
@@ -278,7 +511,7 @@ extern "C" __global__ void __raygen__rg()
 
             optixTrace(
                 params.handle, origin, dir,
-                1e-3f, 1e16f, 0.f,
+                params.scene_epsilon, 1e16f, 0.f,
                 OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
                 0, 1, 0,
                 p0, p1, p2, p3, p4, p5, p6,
@@ -330,8 +563,8 @@ extern "C" __global__ void __raygen__rg()
                     float dist = sqrtf(dist2);
                     float3 wi = toLight * (1.f / dist);
                     float cosN = dot(n, wi);
-                    float3 ln = normalize(cross(lt.v1 - lt.v0, lt.v2 - lt.v0));
-                    float cosLight = fabsf(dot(ln, wi));
+                    // float3 ln = normalize(cross(lt.v1 - lt.v0, lt.v2 - lt.v0));
+                    float cosLight = -dot(lt.normal, wi); // light face-forward check
                     if (cosN > 0.f && cosLight > 1e-4f && isVisible(hitpos, lp)) {
                         float pLightArea = 1.f / (params.num_lights * lt.area);
                         float pLightSA = pLightArea * dist2 / cosLight;
@@ -356,16 +589,15 @@ extern "C" __global__ void __raygen__rg()
 
             } else if (matType == MAT_MIRROR) {
                 // Perfect specular reflection
-                // Fix: throughput gets ALL 3 albedo channels (was missing .z)
                 float3 newdir = normalize(dir - 2.f * dot(dir, n) * n);
-                throughput = throughput * albedo; // tint: full RGB
+                throughput = throughput * albedo;
                 nextBsdfPdf = 0.f; // delta -> MIS uses full emission weight
-                origin = hitpos + 1e-3f * newdir;
+                origin = hitpos + params.scene_epsilon * newdir;
                 dir = newdir;
 
             } else {
                 // Glass: stochastic Fresnel
-                // Fix: use randf(rng) for Fresnel decision (was deterministic fr>0.5)
+                // using randf(rng) for Fresnel decision
                 float ior = params.materials[mat_id].ior;
                 // outsideFlag: CH set 1 if dot(raydir, geo_n) < 0 (entering medium)
                 float eta = outsideFlag ? (1.f / ior) : ior;
@@ -377,12 +609,16 @@ extern "C" __global__ void __raygen__rg()
                 bool doReflect = !refractDir(dir, n, eta, newdir); // TIR
                 if (!doReflect)
                     doReflect = (randf(rng) < fr); // stochastic Fresnel
-                if (doReflect)
+                if (doReflect) {
                     newdir = normalize(dir - 2.f * dot(dir, n) * n);
+                } else {
+                    // This walk carries radiance, so a transmission scales it
+                    // by eta*eta; see the note above refractDir.
+                    throughput = throughput * (eta * eta);
+                }
 
-                // throughput unchanged — the stochastic choice is unbiased
                 nextBsdfPdf = 0.f;
-                origin = hitpos + 1e-3f * newdir;
+                origin = hitpos + params.scene_epsilon * newdir;
                 dir = newdir;
             }
         }
@@ -419,26 +655,60 @@ extern "C" __global__ void __raygen__rg()
 
 extern "C" __global__ void __raygen__photon()
 {
-    const int photon_id = optixGetLaunchIndex().x;
-    unsigned int rng = photon_id * 2791u
-        + (unsigned int)params.frame_index * 5923u + 1847u;
+    const unsigned int photon_id = optixGetLaunchIndex().x;
+    unsigned int rng = hashSeed3(photon_id, (unsigned int)params.frame_index,
+        (unsigned int)params.seed ^ RNG_STREAM_PHOTON);
 
-    if (params.num_lights == 0)
+    const bool hasEnv = (params.emit_sky_photons != 0)
+        && (params.sky_intensity > 0.f)
+        && (params.scene_radius > 0.f);
+    const bool hasLights = (params.num_lights > 0);
+    if (!hasEnv && !hasLights)
         return;
-    int lIdx = min((int)(randf(rng) * params.num_lights), params.num_lights - 1);
-    const EmissiveTriangle& lt = params.lights[lIdx];
 
-    float3 origin = sampleTriangle(lt.v0, lt.v1, lt.v2, randf(rng), randf(rng));
-    float3 ln = normalize(cross(lt.v1 - lt.v0, lt.v2 - lt.v0));
-    float3 t, b;
-    onb(ln, t, b);
-    float3 local = cosineSampleHemisphere(randf(rng), randf(rng));
-    float3 dir = normalize(toWorld(local, ln, t, b));
+    // Split the paths between the two emitters in proportion to their flux
+    // (the host works the ratio out once per pass).
+    const float pEnv = hasLights ? (hasEnv ? params.sky_select_prob : 0.f) : 1.f;
 
-    float3 power = lt.emission * lt.area * M_PIf
-        * (float)params.num_lights
-        * (1.0f / (float)params.num_photons)
-        * params.photon_power_scale;
+    float3 origin, dir, power;
+
+    if (randf(rng) < pEnv) {
+        // Environment light.  Choose a travel direction uniformly on the
+        // sphere, then a start point on the disc of radius R facing it, pushed
+        // back so the photon enters from outside the scene:
+        //     Φ = L(-ω) · πR² / p(ω),   p(ω) = 1/4π   ->   Φ = L(-ω) · 4π²R²
+        float3 w = uniformSampleSphere(randf(rng), randf(rng));
+        float3 t, b;
+        onb(w, t, b);
+        float2 d = concentricSampleDisk(randf(rng), randf(rng));
+        const float R = params.scene_radius;
+
+        origin = params.scene_center + R * (d.x * t + d.y * b) - R * w;
+        dir = w;
+        power = skyRadiance(-w, params.sky_intensity)
+            * ((4.f * M_PIf * M_PIf * R * R)
+                / ((float)params.num_photon_paths * pEnv));
+    } else {
+        // Emissive triangle: uniform over the list, uniform over its area,
+        // cosine-weighted over its hemisphere.  A Lambertian emitter radiates
+        // Φ = L_e · A · π.
+        int lIdx = min((int)(randf(rng) * params.num_lights), params.num_lights - 1);
+        const EmissiveTriangle& lt = params.lights[lIdx];
+
+        float3 ln = lt.normal; // precomputed face normal
+        float3 t, b;
+        onb(ln, t, b);
+        float3 local = cosineSampleHemisphere(randf(rng), randf(rng));
+
+        origin = sampleTriangle(lt.v0, lt.v1, lt.v2, randf(rng), randf(rng))
+            + params.scene_epsilon * ln;
+        dir = normalize(toWorld(local, ln, t, b));
+        power = lt.emission
+            * ((lt.area * M_PIf * (float)params.num_lights)
+                / ((float)params.num_photon_paths * (1.f - pEnv)));
+    }
+
+    power = power * params.photon_power_scale;
 
     for (int depth = 0; depth < params.max_depth; depth++) {
         // Payload: same as CH layout
@@ -455,7 +725,7 @@ extern "C" __global__ void __raygen__photon()
 
         optixTrace(
             params.handle, origin, dir,
-            1e-3f, 1e16f, 0.f,
+            params.scene_epsilon, 1e16f, 0.f,
             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
             0, 1, 0,
             p0, p1, p2, p3, p4, p5, p6,
@@ -484,14 +754,23 @@ extern "C" __global__ void __raygen__photon()
             float survive = fmaxf(albedo.x, fmaxf(albedo.y, albedo.z));
             survive = fmaxf(survive, 0.05f);
 
-            int slot = atomicAdd(params.photon_count, 1);
-            if (slot < params.num_photons) {
-                Photon ph;
-                ph.pos = hitpos;
-                ph.power = power;
-                ph.dir = -dir;
-                ph._pad = 0.f;
-                params.photon_map[slot] = ph;
+            // depth == 0 is a photon straight off the light, i.e. the direct
+            // term.  The gather computes that analytically with shadow rays,
+            // so storing it here would both double-count and hand the noisiest
+            // part of the image to the density estimate.  Everything past the
+            // first bounce — indirect light and caustics through L S+ D — is
+            // what the map is for.
+            if (depth > 0 || params.store_direct_photons) {
+                int slot = atomicAdd(params.photon_count, 1);
+                if (slot < params.photon_capacity) {
+                    Photon ph;
+                    ph.pos = hitpos;
+                    ph.power = power;
+                    ph.dir = -dir;
+                    ph.normal = n;
+                    ph.depth = depth;
+                    params.photon_map[slot] = ph;
+                }
             }
 
             if (randf(rng) > survive)
@@ -502,12 +781,12 @@ extern "C" __global__ void __raygen__photon()
             onb(n, tv, bv);
             float3 loc = cosineSampleHemisphere(randf(rng), randf(rng));
             dir = normalize(toWorld(loc, n, tv, bv));
-            origin = hitpos;
+            origin = hitpos + params.scene_epsilon * n;
 
         } else if (matType == MAT_MIRROR) {
             dir = normalize(dir - 2.f * dot(dir, n) * n);
             power = power * albedo;
-            origin = hitpos + 1e-3f * dir;
+            origin = hitpos + params.scene_epsilon * dir;
 
         } else { // MAT_GLASS
             float ior = params.materials[mat_id].ior;
@@ -521,7 +800,7 @@ extern "C" __global__ void __raygen__photon()
             if (doRefl)
                 newdir = normalize(dir - 2.f * dot(dir, n) * n);
             dir = newdir;
-            origin = hitpos + 1e-3f * dir;
+            origin = hitpos + params.scene_epsilon * dir;
         }
     }
 }
@@ -530,7 +809,8 @@ extern "C" __global__ void __raygen__gather()
 {
     const uint3 idx = optixGetLaunchIndex();
     const int pixel = idx.y * params.width + idx.x;
-    unsigned int rng = pixel * 1973u + (unsigned int)params.frame_index * 9277u + 4801u;
+    unsigned int rng = hashSeed3(pixel, (unsigned int)params.frame_index,
+        (unsigned int)params.seed ^ RNG_STREAM_GATHER);
 
     float3 result_over_samples = make_float3(0.f, 0.f, 0.f);
 
@@ -566,7 +846,7 @@ extern "C" __global__ void __raygen__gather()
             unsigned int p13 = 0u, p14 = 0u, p15 = 0u;
 
             optixTrace(params.handle, origin, dir,
-                1e-3f, 1e16f, 0.f,
+                params.scene_epsilon, 1e16f, 0.f,
                 OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
                 0, 1, 0,
                 p0, p1, p2, p3, p4, p5,
@@ -601,18 +881,32 @@ extern "C" __global__ void __raygen__gather()
             result += path_throughput * emission;
 
             if (matType == MAT_DIFFUSE) {
-                // Photon gathering (brute-force)
-                float r = params.gather_radius;
-                float r2 = params.gather_radius * params.gather_radius;
-                int stored = min(*params.photon_count, params.num_photons);
+                // Direct light by next-event estimation.  Skipped when the map
+                // was told to carry the direct photons itself, otherwise the
+                // two would double-count each other.
+                if (!params.store_direct_photons)
+                    result += path_throughput * directLighting(hitpos, n, albedo, rng);
 
-                float3 irradiance = (params.use_grid)
-                    ? gatherPhotonsGrid(hitpos, n, r, r2)
-                    : gatherBruteForce(hitpos, n, r, r2);
-
-                // Normalization of the conical filter k=1: π*r^2 / 3
-                float norm = 3.0f / (M_PIf * r2);
-                irradiance = irradiance * norm;
+                // Indirect light (and caustics) from the photon map.
+                //
+                // The camera walk has spent `depth + 1` vertices to get here
+                // (specular bounces included), and a photon stored at its own
+                // bounce j carries j + 1 vertices of which the last one is this
+                // very point.  The finished path therefore has j + depth + 1
+                // vertices, and the path tracer would have allowed at most
+                // max_depth of them — so a photon may contribute only while
+                //
+                //     j + depth + 1 <= max_depth.
+                //
+                // At depth 0 that admits photons up to j = max_depth-1, exactly
+                // matching a path-traced v1..v_D; at depth = max_depth-1 it
+                // admits none, matching a path tracer left with only its final
+                // shadow ray.  Without this the two budgets are independent and
+                // photon mapping quietly integrates far longer paths.
+                int maxPhotonDepth = params.max_depth - 1 - depth;
+                float usedRadius;
+                float3 irradiance = photonIrradiance(hitpos, n, maxPhotonDepth,
+                    usedRadius);
 
                 // Lambertian BRDF
                 result += path_throughput * albedo * irradiance * M_1_PIf;
@@ -621,7 +915,7 @@ extern "C" __global__ void __raygen__gather()
             } else if (matType == MAT_MIRROR) {
                 path_throughput = path_throughput * albedo;
                 dir = normalize(dir - 2.f * dot(dir, n) * n);
-                origin = hitpos + 1e-3f * dir;
+                origin = hitpos + params.scene_epsilon * dir;
 
             } else { // MAT_GLASS
                 float ior = params.materials[mat_id].ior;
@@ -632,10 +926,18 @@ extern "C" __global__ void __raygen__gather()
                 bool doRefl = !refractDir(dir, n, eta, newdir);
                 if (!doRefl)
                     doRefl = (randf(rng) < fr);
-                if (doRefl)
+                if (doRefl) {
                     newdir = normalize(dir - 2.f * dot(dir, n) * n);
+                } else {
+                    // The gather walk carries radiance just like the path
+                    // tracer's, and this is the half of the photon-mapped path
+                    // that crosses the boundary an odd number of times when the
+                    // photon sits inside the glass.  See the note above
+                    // refractDir.
+                    path_throughput = path_throughput * (eta * eta);
+                }
                 dir = newdir;
-                origin = hitpos + 1e-3f * dir;
+                origin = hitpos + params.scene_epsilon * dir;
             }
         }
 
@@ -703,6 +1005,10 @@ extern "C" __global__ void __closesthit__ch()
         emission = mat.emission;
     }
 
+    if (!outside) {
+        emission = make_float3(0.f, 0.f, 0.f); // no emission from backface
+    }
+
     float3 hitpos = optixGetWorldRayOrigin() + optixGetRayTmax() * raydir;
 
     // Read radiance + throughput + bsdfpdf from incoming payload
@@ -728,7 +1034,7 @@ extern "C" __global__ void __closesthit__ch()
                     float dist2 = dot(toSurf, toSurf);
                     float3 ln = normalize(cross(params.lights[li].v1 - params.lights[li].v0,
                         params.lights[li].v2 - params.lights[li].v0));
-                    float cosL = fabsf(dot(ln, -raydir));
+                    float cosL = dot(params.lights[li].normal, -raydir);
                     float parea = 1.f / (params.num_lights * params.lights[li].area);
                     pLightSA = parea * dist2 / fmaxf(cosL, 1e-4f);
                     break;
@@ -772,14 +1078,10 @@ extern "C" __global__ void __closesthit__ch()
 // Primary miss: sky gradient
 extern "C" __global__ void __miss__ms()
 {
-    MissData* data = reinterpret_cast<MissData*>(optixGetSbtDataPointer());
+    // The sky lives in params (not in the miss record) so that the photon
+    // emitter can shoot the very same environment — see skyRadiance().
     float3 raydir = optixGetWorldRayDirection();
-
-    float t = fminf(fmaxf(0.5f * (raydir.y + 1.f), 0.f), 1.f);
-    float3 sky = make_float3((1.f - t) * 1.0f + t * 0.4f,
-                     (1.f - t) * 0.95f + t * 0.6f,
-                     (1.f - t) * 0.85f + t * 1.0f)
-        * data->bg_color.x;
+    float3 sky = skyRadiance(raydir, params.sky_intensity);
 
     float3 radiance = make_float3(__uint_as_float(optixGetPayload_0()),
         __uint_as_float(optixGetPayload_1()),
@@ -802,57 +1104,124 @@ extern "C" __global__ void __miss__shadow()
     optixSetPayload_0(1u); // unoccluded = true
 }
 
+// Photon visualisation: splat every stored photon straight onto the film.
+//
+// A photon carries *flux* (Φ, in watts), but a pixel has to end up holding
+// *radiance*.  Adding Φ to a pixel — as this used to do — measures the wrong
+// quantity entirely, and because flux does not depend on where you stand, every
+// photon stayed equally bright from every distance and every angle.  The
+// missing piece is the area of surface that one pixel actually covers:
+//
+//   pixel area on the image plane   A_pix = (2|cam_u|/W) · (2|cam_v|/H)
+//   solid angle it subtends         dω    = A_pix · cos³θ / f²
+//   surface patch it sees           dA    = dω · dist² / cosSurf
+//
+// with f = |cam_w| the image-plane distance, θ the angle off the camera axis
+// (cosθ = depth/dist) and cosSurf the angle between the photon's surface normal
+// and the direction back to the eye.  cos³θ is the usual pinhole falloff: one
+// step of cosine for the foreshortening of the pixel itself and two for it
+// being further away off-axis.
+//
+// Irradiance is then E = Φ/dA, and a white Lambertian surface reflects
+// L = E/π.  That is what gets splatted, so the result is directly comparable to
+// the photon-mapped image: tilt a surface away and dA grows, each photon dims,
+// but more of them land in the pixel — the two cancel, exactly as they should
+// for a diffuse surface, instead of the flat over-bright wash from before.
 extern "C" __global__ void __raygen__lightvis()
 {
     const int pid = (int)optixGetLaunchIndex().x;
 
-    const int stored = min(*params.photon_count, params.num_photons);
+    const int stored = min(*params.photon_count, params.photon_capacity);
     if (pid >= stored)
         return;
 
     const Photon& ph = params.photon_map[pid];
 
-    // Photon projection to camera plane (rasterization)
-    float3 toP = ph.pos - params.cam_eye;
+    // Camera frame.  cam_w reaches the centre of the image plane, so its length
+    // is the plane distance; cam_u / cam_v are the plane's half-extents.
+    const float f = length(params.cam_w);
+    const float u_scale = length(params.cam_u);
+    const float v_scale = length(params.cam_v);
+    if (f < 1e-10f || u_scale < 1e-10f || v_scale < 1e-10f)
+        return;
 
-    float cam_w_len = length(params.cam_w);
-    if (cam_w_len < 1e-10f) return;
-    float3 cam_w_norm = params.cam_w * (1.f / cam_w_len);
+    const float3 fwd = params.cam_w * (1.f / f);
+    const float3 right = params.cam_u * (1.f / u_scale);
+    const float3 up = params.cam_v * (1.f / v_scale);
 
-    // Depth along the forward axis
-    float depth = dot(toP, cam_w_norm);
-    if (depth < 1e-3f) return;   // behind the camera
+    const float3 toP = ph.pos - params.cam_eye;
+    const float depth = dot(toP, fwd);
+    if (depth < params.scene_epsilon)
+        return; // behind the camera
 
-    // Scales of cam_u and cam_v (= h*aspect and h)
-    float u_scale = length(params.cam_u);
-    float v_scale = length(params.cam_v);
-    if (u_scale < 1e-10f || v_scale < 1e-10f) return;
+    const float dist2 = dot(toP, toP);
+    const float dist = sqrtf(dist2);
+    const float3 view = toP * (1.f / dist); // eye -> photon
 
-    float3 cam_u_norm = params.cam_u * (1.f / u_scale);
-    float3 cam_v_norm = params.cam_v * (1.f / v_scale);
+    // Only photons on a surface turned towards the camera are visible.
+    const float cosSurf = dot(ph.normal, -view);
+    if (cosSurf < 1e-4f)
+        return;
 
-    // NDC coordinates: px, py ∈ [-1, 1]
-    float px = dot(toP, cam_u_norm) / (depth * u_scale);
-    float py = dot(toP, cam_v_norm) / (depth * v_scale);
-
+    // NDC in [-1,1], matching the primary ray construction in __raygen__rg.
+    const float px = dot(toP, right) * f / (depth * u_scale);
+    const float py = dot(toP, up) * f / (depth * v_scale);
     if (px < -1.f || px > 1.f || py < -1.f || py > 1.f)
         return;
 
-    // Raster coordinates (Y down, X right)
-    int ix = (int)((px * 0.5f + 0.5f) * (float)params.width);
-    int iy = (int)((py * 0.5f + 0.5f) * (float)params.height);
-    ix = max(0, min(ix, (int)params.width  - 1));
-    iy = max(0, min(iy, (int)params.height - 1));
-
-    // Shadow ray
-    if (!isVisible(ph.pos, params.cam_eye))
+    if (!isVisible(ph.pos + params.scene_epsilon * ph.normal, params.cam_eye))
         return;
 
-    // Atomic splat in lightvis_buffer
-    // lightvis_buffer is stored as float* (3 floats per pixel, interleaved)
-    int pixel = iy * (int)params.width + ix;
+    // Flux -> radiance.
+    const float A_pix = (2.f * u_scale / (float)params.width)
+        * (2.f * v_scale / (float)params.height);
+    const float cosT = depth / dist;
+    const float dA = A_pix * cosT * cosT * cosT * dist2 / (f * f * cosSurf);
+    if (dA < 1e-20f)
+        return;
+
+    const float3 L = ph.power * (M_1_PIf / dA);
+
+    // Continuous film coordinates (pixel centres sit at integer + 0.5).
+    const float fx = (px * 0.5f + 0.5f) * (float)params.width - 0.5f;
+    const float fy = (py * 0.5f + 0.5f) * (float)params.height - 0.5f;
+    const int cx = (int)floorf(fx + 0.5f);
+    const int cy = (int)floorf(fy + 0.5f);
+
+    // A one-pixel splat of a point sample is extremely speckly, so spread the
+    // photon over a small separable tent whose weights sum to one.  That
+    // conserves flux — it only blurs the estimate, it does not brighten it.
+    const int R = min(max(params.lightvis_splat_px, 0), 4);
+    float wx[9], wy[9];
+    float sx = 0.f, sy = 0.f;
+    for (int i = -R; i <= R; ++i) {
+        wx[i + R] = fmaxf(1.f - fabsf((float)(cx + i) - fx) / (float)(R + 1), 0.f);
+        wy[i + R] = fmaxf(1.f - fabsf((float)(cy + i) - fy) / (float)(R + 1), 0.f);
+        sx += wx[i + R];
+        sy += wy[i + R];
+    }
+    if (sx <= 0.f || sy <= 0.f)
+        return;
+
+    // lightvis_buffer is float* with 3 interleaved floats per pixel
     float* buf = params.lightvis_buffer;
-    atomicAdd(buf + pixel * 3 + 0, ph.power.x);
-    atomicAdd(buf + pixel * 3 + 1, ph.power.y);
-    atomicAdd(buf + pixel * 3 + 2, ph.power.z);
+    const int W = (int)params.width, H = (int)params.height;
+
+    for (int j = -R; j <= R; ++j) {
+        int y = cy + j;
+        if (y < 0 || y >= H)
+            continue;
+        for (int i = -R; i <= R; ++i) {
+            int x = cx + i;
+            if (x < 0 || x >= W)
+                continue;
+            float w = (wx[i + R] / sx) * (wy[j + R] / sy);
+            if (w <= 0.f)
+                continue;
+            int pixel = y * W + x;
+            atomicAdd(buf + pixel * 3 + 0, L.x * w);
+            atomicAdd(buf + pixel * 3 + 1, L.y * w);
+            atomicAdd(buf + pixel * 3 + 2, L.z * w);
+        }
+    }
 }
