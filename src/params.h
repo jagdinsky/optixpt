@@ -144,9 +144,26 @@ struct Params {
     int num_photon_paths; // paths emitted per pass
     int photon_capacity; // photon slots allocated in photon_map
     int* photon_count; // number of deposits attempted this pass (device pointer)
-    float gather_radius; // maximum gather radius
+    float gather_radius; // maximum gather radius *for the current frame*
     int adaptive_radius; // 1 = shrink the radius towards target_photons
     int target_photons; // photons the adaptive radius aims to collect
+
+    // Probabilistic PPM (Knaus & Zwicker 2011).  Every frame is an independent
+    // photon-mapping estimate and the accumulation buffer averages them, so the
+    // only thing needed to drive the bias to zero is a radius that shrinks with
+    // the frame index:  r_{i+1} = r_i * sqrt((i + alpha)/(i + 1)),  i = 1..N.
+    // The schedule is global and deterministic — no per-pixel statistics — which
+    // is exactly why it drops into this renderer's existing accumulate loop.
+    //
+    // alpha = 2/3 balances the two error terms: averaging N frames leaves
+    // bias^2 ~ N^(2*alpha-2) and variance ~ N^(-alpha), and 2*alpha-2 = -alpha
+    // at alpha = 2/3, giving MSE ~ N^(-2/3).  It is also the value at which a
+    // fixed photon budget is best spent on more frames rather than more photons
+    // per frame.  Below 2/3 the radius shrinks faster and noise dominates;
+    // above it the blur is what is left over.
+    int use_ppm; // 1 = drive gather_radius from the schedule below
+    float ppm_alpha; // the alpha in the recurrence
+    float ppm_radius_initial; // r_1; gather_radius at frame_index 0
     int store_direct_photons; // 1 = also store first-hit photons (then the
                               // gather must NOT add its own direct lighting)
 

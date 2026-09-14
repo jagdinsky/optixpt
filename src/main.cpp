@@ -320,6 +320,13 @@ struct RunArgs {
     int seed = 0; // random seed; same settings + different seed = independent run
     float skyIntensity = -1.f; // <0 = keep the built-in default
     int skyPhotons = -1; // <0 = keep the built-in default
+    float ppmAlpha = -1.f; // <0 = default (2/3); 0 = disable the schedule
+    // r_1 and the target r_N, both as a fraction of scene_radius.  <0 = unset.
+    // Giving the *final* radius is usually what you want: the schedule fixes
+    // r_N/r_1 for a given frame count, so naming r_N pins the blur you are
+    // actually going to look at and lets r_1 fall out of it.
+    float radius = -1.f;
+    float finalRadius = -1.f;
     std::string cameraFile = "camera.txt";
     std::string outputFile = "../build/output.exr";
 };
@@ -347,6 +354,17 @@ static RunArgs parseArgs(int argc, char** argv) {
             args.skyIntensity = (float)atof(argv[++i]);
         } else if (a == "--sky-photons" && i + 1 < argc) {
             args.skyPhotons = atoi(argv[++i]) ? 1 : 0;
+        } else if (a == "--ppm-alpha" && i + 1 < argc) {
+            // 0 turns the schedule off (fixed radius); otherwise clamped to the
+            // open interval the recurrence is defined on.
+            float v = (float)atof(argv[++i]);
+            args.ppmAlpha = (v <= 0.f) ? 0.f : std::min(v, 0.999f);
+        } else if (a == "--no-ppm") {
+            args.ppmAlpha = 0.f;
+        } else if (a == "--radius" && i + 1 < argc) {
+            args.radius = (float)atof(argv[++i]);
+        } else if (a == "--final-radius" && i + 1 < argc) {
+            args.finalRadius = (float)atof(argv[++i]);
         } else if (a == "--camera" && i + 1 < argc) {
             args.cameraFile = argv[++i];
         } else if (a == "--output" && i + 1 < argc) {
@@ -1072,6 +1090,42 @@ static GLFWwindow* initGL()
     return w;
 }
 
+// The probabilistic-PPM radius for frame `frameIndex` (0-based), i.e. r_i with
+// i = frameIndex + 1 in  r_{i+1} = r_i * sqrt((i + alpha)/(i + 1)).
+//
+// Evaluated in closed form rather than by repeated multiplication.  Telescoping
+// the product gives
+//
+//     (r_i / r_1)^2 = [Gamma(i+a)/Gamma(1+a)] * [Gamma(2)/Gamma(i+1)]
+//
+// which costs the same as the incremental update but does not accumulate float
+// drift over thousands of frames and — the reason it matters here — is a pure
+// function of frame_index.  The realtime loop resets frame_index whenever the
+// camera moves, and this way the radius resets with it for free instead of
+// needing its own piece of state kept in sync.
+//
+// Note how slowly this falls: r_i / r_1 ~ i^(-(1-alpha)/2), so at alpha = 2/3 a
+// thousand frames buy a factor of 3.  The schedule guarantees the bias vanishes;
+// it does not rescue a badly chosen r_1, which still has to be roughly the
+// radius you want.
+static float ppmRadius(float r1, float alpha, int frameIndex)
+{
+    const int i = frameIndex + 1;
+    if (i <= 1)
+        return r1;
+    const double logRatio = (std::lgamma(i + (double)alpha) - std::lgamma(1.0 + (double)alpha))
+        - (std::lgamma(i + 1.0) - std::lgamma(2.0));
+    return r1 * (float)std::exp(0.5 * logRatio);
+}
+
+// Set gather_radius for the frame about to be traced.  Must run *before*
+// launchPhotonTracing: buildPhotonGrid bins the map at this radius.
+static void updatePPMRadius(Params& p)
+{
+    if (p.use_ppm)
+        p.gather_radius = ppmRadius(p.ppm_radius_initial, p.ppm_alpha, p.frame_index);
+}
+
 void buildPhotonGrid(Params& params,
     CUdeviceptr& dGridCellStart,
     CUdeviceptr& dGridCellCount,
@@ -1114,16 +1168,29 @@ void buildPhotonGrid(Params& params,
     bmax.y += r;
     bmax.z += r;
 
+    // The grid is binned at `cs`, normally the gather radius itself.  The axis
+    // count is capped, and the cap has to be absorbed by *growing the cell*
+    // rather than by clamping dims alone: the host below clamps an out-of-range
+    // photon into the edge cell, while the device derives its index from
+    // grid.cell_size and skips anything outside dims, so if the two disagree the
+    // gather silently loses photons.  Growing cs instead keeps them consistent
+    // and stays correct, because the device's 3x3x3 walk covers the search
+    // sphere for any cs >= r (it is only slower, more photons per cell to test).
+    //
+    // This matters now that the PPM schedule shrinks r every frame: cell count
+    // grows as r^-3, so a factor-3 radius reduction is 27x the cells.
+    const int kMaxCellsPerAxis = 1024;
+    const float extX = bmax.x - bmin.x, extY = bmax.y - bmin.y, extZ = bmax.z - bmin.z;
+    float cs = r;
+    cs = std::max(cs, extX / kMaxCellsPerAxis);
+    cs = std::max(cs, extY / kMaxCellsPerAxis);
+    cs = std::max(cs, extZ / kMaxCellsPerAxis);
+
     // grid dimensions (number of cells in each direction)
     int3 dims;
-    dims.x = std::max(1, (int)std::ceil((bmax.x - bmin.x) / r));
-    dims.y = std::max(1, (int)std::ceil((bmax.y - bmin.y) / r));
-    dims.z = std::max(1, (int)std::ceil((bmax.z - bmin.z) / r));
-
-    // limit grid size to 512^3 cells
-    dims.x = std::min(dims.x, 1024);
-    dims.y = std::min(dims.y, 1024);
-    dims.z = std::min(dims.z, 1024);
+    dims.x = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extX / cs)));
+    dims.y = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extY / cs)));
+    dims.z = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extZ / cs)));
 
     int totalCells = dims.x * dims.y * dims.z;
     std::cout << "[PhotonGrid] dims = " << dims.x << "x" << dims.y << "x" << dims.z
@@ -1132,9 +1199,9 @@ void buildPhotonGrid(Params& params,
 
     // Count photons in each cell
     auto cellIndex = [&](float3 pos) -> int {
-        int ix = (int)std::floor((pos.x - bmin.x) / r);
-        int iy = (int)std::floor((pos.y - bmin.y) / r);
-        int iz = (int)std::floor((pos.z - bmin.z) / r);
+        int ix = (int)std::floor((pos.x - bmin.x) / cs);
+        int iy = (int)std::floor((pos.y - bmin.y) / cs);
+        int iz = (int)std::floor((pos.z - bmin.z) / cs);
         ix = std::max(0, std::min(ix, dims.x - 1));
         iy = std::max(0, std::min(iy, dims.y - 1));
         iz = std::max(0, std::min(iz, dims.z - 1));
@@ -1194,7 +1261,7 @@ void buildPhotonGrid(Params& params,
     params.grid.aabb_min = bmin;
     params.grid.aabb_max = bmax;
     params.grid.dims = dims;
-    params.grid.cell_size = r;
+    params.grid.cell_size = cs;
     params.grid.cell_start = reinterpret_cast<int*>(dGridCellStart);
     params.grid.cell_count = reinterpret_cast<int*>(dGridCellCount);
     params.grid.grid_photon_ids = reinterpret_cast<int*>(dGridPhotonIds);
@@ -1463,15 +1530,41 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
     p.frame_index  = 0;
 
+    // Print the schedule up front.  The last frame's radius is not the blur you
+    // get: the frames are averaged with equal weight, so what the image behaves
+    // like is sqrt(mean r_i^2), which settles around 1.22*r_N.  Seeing all three
+    // is what stops r_1 from being chosen by feel.
+    if (p.render_mode == 1 && p.use_ppm) {
+        double sum2 = 0.0;
+        for (int f = 0; f < p.offline_frames; ++f) {
+            const double ri = ppmRadius(p.ppm_radius_initial, p.ppm_alpha, f);
+            sum2 += ri * ri;
+        }
+        const double rEff = std::sqrt(sum2 / p.offline_frames);
+        const float rN = ppmRadius(p.ppm_radius_initial, p.ppm_alpha, p.offline_frames - 1);
+        std::cout << "[PPM] alpha = " << p.ppm_alpha
+                  << "  frames = " << p.offline_frames
+                  << "\n      r1   = " << p.ppm_radius_initial
+                  << "  (" << (p.ppm_radius_initial / p.scene_radius) << " of scene radius)"
+                  << "\n      rN   = " << rN << "  (" << (rN / p.ppm_radius_initial) << " of r1)"
+                  << "\n      reff = " << rEff << "  <- the blur the averaged image actually has\n";
+    }
+
     for (int f = 0; f < p.offline_frames; ++f) {
 
         if (p.render_mode == 0) {
             // Path Tracing launch
             launchPathTracing(state, p, stream);
         } else if (p.render_mode == 1) {
+            // Probabilistic PPM: shrink the radius for this frame *before* the
+            // map is traced, because buildPhotonGrid bins at gather_radius.
+            updatePPMRadius(p);
+
             // Pass 1 — Photon tracing.  A fresh map every frame: reusing one
             // map would make every frame share the same density-estimate
             // error, so the blotches would stay put no matter how long it ran.
+            // It is also what makes the frames independent estimates, which is
+            // the assumption the PPM radius schedule is derived under.
             launchPhotonTracing(state, p, stream);
 
             // Pass 2 — Gathering
@@ -1482,7 +1575,8 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
         }
 
         p.frame_index++;
-        std::cout << "\rOffline frame " << (f + 1) << "/" << p.offline_frames << std::flush;
+        std::cout << "\rOffline frame " << (f + 1) << "/" << p.offline_frames
+                  << "  r = " << p.gather_radius << std::flush;
     }
 
     std::cout << "\n";
@@ -1651,17 +1745,42 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
 
             float rMin = 0.001f * p.scene_radius;
             float rMax = 0.200f * p.scene_radius;
-            if (ImGui::SliderFloat("Gather radius", &p.gather_radius, rMin, rMax, "%.4f")) {
+            const char* rLabel = p.use_ppm ? "Initial radius (r1)" : "Gather radius";
+            if (ImGui::SliderFloat(rLabel, &p.ppm_radius_initial, rMin, rMax, "%.4f")) {
+                p.gather_radius = p.ppm_radius_initial;
                 resetAccum = true;
                 resetPhotons = true; // the grid is binned at this radius
             }
 
+            bool ppm = p.use_ppm != 0;
+            if (ImGui::Checkbox("Progressive radius (PPM)", &ppm)) {
+                p.use_ppm = ppm ? 1 : 0;
+                if (!p.use_ppm)
+                    p.gather_radius = p.ppm_radius_initial;
+                else
+                    p.adaptive_radius = 0; // the two do not compose
+                resetAccum = true;
+                resetPhotons = true;
+            }
+            if (p.use_ppm) {
+                if (ImGui::SliderFloat("alpha", &p.ppm_alpha, 0.30f, 0.99f, "%.3f")) {
+                    resetAccum = true;
+                    resetPhotons = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(2/3 = MSE-optimal)");
+                // r shrinks as i^(-(1-alpha)/2), which is slow enough that it is
+                // worth showing rather than assuming.
+                ImGui::Text("r = %.5f   (%.2f%% of r1)", p.gather_radius,
+                    100.f * p.gather_radius / std::max(p.ppm_radius_initial, 1e-9f));
+            }
+
             bool adaptive = p.adaptive_radius != 0;
-            if (ImGui::Checkbox("Adaptive radius", &adaptive)) {
+            if (!p.use_ppm && ImGui::Checkbox("Adaptive radius", &adaptive)) {
                 p.adaptive_radius = adaptive ? 1 : 0;
                 resetAccum = true;
             }
-            if (adaptive) {
+            if (!p.use_ppm && adaptive) {
                 if (ImGui::SliderInt("Target photons", &p.target_photons, 8, 512))
                     resetAccum = true;
             }
@@ -1808,6 +1927,12 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             // (as this used to) freezes its density-estimate error into the
             // image, which is what left the permanent blotches.
             if (retracePhotons || !photons_valid) {
+                // Before the trace — the grid is binned at gather_radius.  With
+                // "Retrace every frame" off the map (and so the radius) is
+                // frozen, which is consistent: a schedule that shrank the radius
+                // over a map that never changes would just re-filter the same
+                // photons and converge to nothing.
+                updatePPMRadius(p);
                 lastDeposits = launchPhotonTracing(state, p, stream);
                 photons_valid = true;
             }
@@ -1904,7 +2029,19 @@ int main(int argc, char** argv) {
     // that happens to be hucdge for the scene is exactly what smears the photon
     // estimate into big soft stains.
     p.gather_radius = 0.03f * p.scene_radius;
-    p.adaptive_radius = 1;
+
+    // Probabilistic PPM.  alpha = 2/3 is the MSE-optimal exponent, not a taste
+    // knob — see the derivation on Params::use_ppm.
+    p.use_ppm = (args.ppmAlpha >= 0.f) ? (args.ppmAlpha > 0.f ? 1 : 0) : 1;
+    p.ppm_alpha = (args.ppmAlpha > 0.f) ? args.ppmAlpha : 2.f / 3.f;
+    p.ppm_radius_initial = p.gather_radius;
+
+    // The per-pixel adaptive shrink and the PPM schedule are two answers to the
+    // same question and they do not compose.  Worse, the adaptive one picks its
+    // radius from the photon count of the very map it then integrates, so the
+    // radius is correlated with the flux — a bias the schedule's analysis does
+    // not cover and cannot drive to zero.  PPM wins; adaptive is the fallback.
+    p.adaptive_radius = p.use_ppm ? 0 : 1;
     p.target_photons = 64;
     p.photon_plane_tol = 0.20f; // |offset along n| <= 20% of the radius
     p.photon_normal_tol = 0.70f; // ~45 degrees of normal agreement
@@ -1935,6 +2072,24 @@ int main(int argc, char** argv) {
 
     if (args.frames > 0)
         p.offline_frames = args.frames;
+
+    // Resolve r_1 — after the frame count, because --final-radius is defined in
+    // terms of it.  An oversized r_1 is the expensive mistake here: the frames
+    // are averaged with equal weight, so the early wide-radius frames stay in
+    // the result forever.  Mean bias goes as r_1^2 * N^(alpha-1), so holding the
+    // blur fixed while doubling r_1 costs 2^(2/(1-alpha)) = 64x the frames at
+    // alpha = 2/3.  Naming the final radius instead makes that impossible to get
+    // wrong by accident.
+    if (args.finalRadius > 0.f) {
+        const float rN = args.finalRadius * p.scene_radius;
+        const float shrink = p.use_ppm
+            ? ppmRadius(1.f, p.ppm_alpha, p.offline_frames - 1) : 1.f;
+        p.ppm_radius_initial = rN / shrink;
+    } else if (args.radius > 0.f) {
+        p.ppm_radius_initial = args.radius * p.scene_radius;
+    }
+    p.gather_radius = p.ppm_radius_initial;
+
     if (args.photonPaths > 0)
         p.num_photon_paths = args.photonPaths;
     if (args.maxDepth > 0)

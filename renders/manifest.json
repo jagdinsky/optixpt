@@ -1,0 +1,79 @@
+{
+  "scene": "scene.glb",
+  "camera": "camera.txt",
+  "seed": 1,
+  "paths": 1000000,
+  "budget": 240.0,
+  "sky": null,
+  "sky_photons": null,
+  "started": "2026-09-11 13:33:38",
+  "reference": {
+    "file": "pt_ref_f3039_d32_s1.exr",
+    "mode": "path tracing",
+    "frames": 3039,
+    "depth": 32,
+    "seed": 1,
+    "command": "__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.glb --offline --camera camera.txt --output /home/mestay/renderer/renders/pt_ref_f3039_d32_s1.exr --frames 3039 --depth 32 --seed 1",
+    "seconds": 210.81746435165405
+  },
+  "photon": [
+    {
+      "file": "pm_f32_d8_p1000000_s1.exr",
+      "mode": "photon mapping",
+      "frames": 32,
+      "depth": 8,
+      "paths": 1000000,
+      "seed": 1,
+      "command": "__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.glb --offline --camera camera.txt --output /home/mestay/renderer/renders/pm_f32_d8_p1000000_s1.exr --frames 32 --depth 8 --seed 1 --photon --paths 1000000",
+      "seconds": 22.771318912506104
+    },
+    {
+      "file": "pm_f128_d8_p1000000_s1.exr",
+      "mode": "photon mapping",
+      "frames": 128,
+      "depth": 8,
+      "paths": 1000000,
+      "seed": 1,
+      "command": "__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.glb --offline --camera camera.txt --output /home/mestay/renderer/renders/pm_f128_d8_p1000000_s1.exr --frames 128 --depth 8 --seed 1 --photon --paths 1000000",
+      "seconds": 66.56409621238708
+    },
+    {
+      "file": "pm_f32_d32_p1000000_s1.exr",
+      "mode": "photon mapping",
+      "frames": 32,
+      "depth": 32,
+      "paths": 1000000,
+      "seed": 1,
+      "command": "__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.glb --offline --camera camera.txt --output /home/mestay/renderer/renders/pm_f32_d32_p1000000_s1.exr --frames 32 --depth 32 --seed 1 --photon --paths 1000000",
+      "seconds": 39.674891233444214
+    },
+    {
+      "file": "pm_f128_d32_p1000000_s1.exr",
+      "mode": "photon mapping",
+      "frames": 128,
+      "depth": 32,
+      "paths": 1000000,
+      "seed": 1,
+      "command": "__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.glb --offline --camera camera.txt --output /home/mestay/renderer/renders/pm_f128_d32_p1000000_s1.exr --frames 128 --depth 32 --seed 1 --photon --paths 1000000",
+      "seconds": 116.11344385147095
+    }
+  ],
+  "calibration": {
+    "startup": 0.4864830176035563,
+    "measured_per_frame": 0.06304878989855449,
+    "slowdown": 1.25,
+    "per_frame": 0.07881098737319311,
+    "probes": [
+      [
+        8,
+        0.9908733367919922
+      ],
+      [
+        32,
+        2.5040442943573
+      ]
+    ],
+    "predicted": 239.99307364473742
+  },
+  "total_seconds": 459.43770718574524
+}
