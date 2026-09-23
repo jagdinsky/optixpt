@@ -78,6 +78,29 @@ __device__ __forceinline__ bool photonUsable(const Photon& ph, float3 x, float3 
     return true;
 }
 
+// Tests the photons grid_photon_ids[start .. end) and accumulates the ones that
+// pass.  [start, end) is one cell of the uniform grid or one bucket of the hash
+// grid.  Both structures call this same loop, so the only thing that differs
+// between them is which ranges get visited — which is the thing being compared.
+__device__ __forceinline__ void gatherRange(int start, int end,
+    float3 hitpos, float3 n, float r2, float invR, float planeTol, float normalTol,
+    int maxPhotonDepth, float3& flux, int& count)
+{
+    const int* ids = params.grid.grid_photon_ids;
+    for (int k = start; k < end; ++k) {
+        const Photon& ph = params.photon_map[ids[k]];
+
+        float d2;
+        if (!photonUsable(ph, hitpos, n, r2, planeTol, normalTol,
+                maxPhotonDepth, d2))
+            continue;
+
+        float weight = 1.f - sqrtf(d2) * invR; // cone filter k=1
+        flux += weight * ph.power;
+        ++count;
+    }
+}
+
 // Cone-filtered flux within `r`, and how many photons contributed.  The count
 // is what lets the caller adapt the radius to the local photon density.
 __device__ void gatherPhotonsGrid(float3 hitpos, float3 n, float r, float r2,
@@ -92,9 +115,9 @@ __device__ void gatherPhotonsGrid(float3 hitpos, float3 n, float r, float r2,
     const float invR = 1.f / r;
 
     // hitpos in grid coordinates
-    int cx = (int)floorf((hitpos.x - g.aabb_min.x) / g.cell_size);
-    int cy = (int)floorf((hitpos.y - g.aabb_min.y) / g.cell_size);
-    int cz = (int)floorf((hitpos.z - g.aabb_min.z) / g.cell_size);
+    const int cx = photonCellCoord(hitpos.x, g.aabb_min.x, g.cell_size);
+    const int cy = photonCellCoord(hitpos.y, g.aabb_min.y, g.cell_size);
+    const int cz = photonCellCoord(hitpos.z, g.aabb_min.z, g.cell_size);
 
     // go over neighboring cells (3x3x3); cell_size is the maximum gather
     // radius, so this neighbourhood always covers the search sphere
@@ -111,23 +134,73 @@ __device__ void gatherPhotonsGrid(float3 hitpos, float3 n, float r, float r2,
                 if (nx < 0 || nx >= g.dims.x)
                     continue;
 
-                int cell = nz * g.dims.y * g.dims.x + ny * g.dims.x + nx;
-                int start = g.cell_start[cell];
-                int cellCount = g.cell_count[cell];
+                const int cell = (nz * g.dims.y + ny) * g.dims.x + nx;
+                gatherRange(g.cell_start[cell], g.cell_start[cell + 1],
+                    hitpos, n, r2, invR, planeTol, normalTol, maxPhotonDepth,
+                    flux, count);
+            }
+        }
+    }
+}
 
-                for (int k = 0; k < cellCount; ++k) {
-                    int pid = g.grid_photon_ids[start + k];
-                    const Photon& ph = params.photon_map[pid];
+// The hash grid visits the same 3x3x3 cells as the uniform grid, but finds
+// each cell's photons through the hash table instead of a dense array.  Two
+// consequences of sharing buckets between cells:
+//
+// 1. A bucket can also hold photons from cells outside the 3x3x3 block that
+//    hashed to the same bucket (a collision).  They need no special handling.
+//    The block contains the whole search sphere, because a cell is at least r
+//    wide, so every photon outside the block is further than r from the query
+//    and the distance test in photonUsable rejects it.  A collision costs time,
+//    never correctness.
+//
+// 2. Two of the 27 cells can hash to the same bucket.  Visiting that bucket a
+//    second time would count its photons twice, which *is* a correctness
+//    error.  So the buckets already visited for this query are remembered, and
+//    a repeated one is skipped.  The list is at most 27 entries and lives in
+//    per-thread local memory, which is cached in L1.
+//
+// Unlike the uniform grid there is no bounds check: every integer cell has a
+// bucket, including cells outside the scene box, which simply hold no photons
+// of their own.
+__device__ void gatherPhotonsHash(float3 hitpos, float3 n, float r, float r2,
+    int maxPhotonDepth, float3& flux, int& count)
+{
+    const PhotonGrid& g = params.grid;
+    flux = make_float3(0.f, 0.f, 0.f);
+    count = 0;
 
-                    float d2;
-                    if (!photonUsable(ph, hitpos, n, r2, planeTol, normalTol,
-                            maxPhotonDepth, d2))
-                        continue;
+    const float planeTol = params.photon_plane_tol * r;
+    const float normalTol = params.photon_normal_tol;
+    const float invR = 1.f / r;
 
-                    float weight = 1.f - sqrtf(d2) * invR; // cone filter k=1
-                    flux += weight * ph.power;
-                    ++count;
+    const int cx = photonCellCoord(hitpos.x, g.aabb_min.x, g.cell_size);
+    const int cy = photonCellCoord(hitpos.y, g.aabb_min.y, g.cell_size);
+    const int cz = photonCellCoord(hitpos.z, g.aabb_min.z, g.cell_size);
+
+    unsigned int visited[27];
+    int numVisited = 0;
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const unsigned int bucket
+                    = hashCell(cx + dx, cy + dy, cz + dz) & g.hash_mask;
+
+                bool alreadyVisited = false;
+                for (int j = 0; j < numVisited; ++j) {
+                    if (visited[j] == bucket) {
+                        alreadyVisited = true;
+                        break;
+                    }
                 }
+                if (alreadyVisited)
+                    continue;
+                visited[numVisited++] = bucket;
+
+                gatherRange(g.cell_start[bucket], g.cell_start[bucket + 1],
+                    hitpos, n, r2, invR, planeTol, normalTol, maxPhotonDepth,
+                    flux, count);
             }
         }
     }
@@ -161,10 +234,17 @@ __device__ void gatherBruteForce(float3 hitpos, float3 n, float r, float r2,
 __device__ __forceinline__ void gatherPhotons(float3 hitpos, float3 n,
     float r, float r2, int maxPhotonDepth, float3& flux, int& count)
 {
-    if (params.use_grid)
+    switch (params.accel) {
+    case ACCEL_UNIFORM_GRID:
         gatherPhotonsGrid(hitpos, n, r, r2, maxPhotonDepth, flux, count);
-    else
+        break;
+    case ACCEL_HASH_GRID:
+        gatherPhotonsHash(hitpos, n, r, r2, maxPhotonDepth, flux, count);
+        break;
+    default:
         gatherBruteForce(hitpos, n, r, r2, maxPhotonDepth, flux, count);
+        break;
+    }
 }
 
 // Irradiance from the photon map at a surface point.
@@ -805,167 +885,185 @@ extern "C" __global__ void __raygen__photon()
     }
 }
 
-extern "C" __global__ void __raygen__gather()
+// Pass 1 of the gather: walk the camera path and park it at the first diffuse
+// vertex, writing one GatherPoint per pixel.  Everything that does not need the
+// photon map is finished here — emission, next-event direct lighting, and the
+// specular chain that leads to the diffuse vertex.
+//
+// Exactly one camera sample per pixel: see the note on Params::samples_per_pixel
+// for why photon mapping spends extra budget on frames instead.
+extern "C" __global__ void __raygen__camera()
 {
     const uint3 idx = optixGetLaunchIndex();
     const int pixel = idx.y * params.width + idx.x;
     unsigned int rng = hashSeed3(pixel, (unsigned int)params.frame_index,
         (unsigned int)params.seed ^ RNG_STREAM_GATHER);
 
-    float3 result_over_samples = make_float3(0.f, 0.f, 0.f);
+    GatherPoint gp;
+    gp.pos = make_float3(0.f, 0.f, 0.f);
+    gp.normal = make_float3(0.f, 0.f, 1.f);
+    gp.weight = make_float3(0.f, 0.f, 0.f);
+    gp.direct = make_float3(0.f, 0.f, 0.f);
+    gp.max_photon_depth = 0;
+    gp.valid = 0;
 
-    for (int s = 0; s < params.samples_per_pixel; s++) {
-        float pu = (idx.x + randf(rng)) / params.width;
-        float pv = (idx.y + randf(rng)) / params.height;
+    float pu = (idx.x + randf(rng)) / params.width;
+    float pv = (idx.y + randf(rng)) / params.height;
 
-        float3 origin = params.cam_eye;
-        float3 dir = normalize(params.cam_w
-            + (2.f * pu - 1.f) * params.cam_u
-            + (2.f * pv - 1.f) * params.cam_v);
+    float3 origin = params.cam_eye;
+    float3 dir = normalize(params.cam_w
+        + (2.f * pu - 1.f) * params.cam_u
+        + (2.f * pv - 1.f) * params.cam_v);
 
-        float3 result = make_float3(0.f, 0.f, 0.f);
-        float3 path_throughput = make_float3(1.f, 1.f, 1.f);
+    float3 result = make_float3(0.f, 0.f, 0.f);
+    float3 path_throughput = make_float3(1.f, 1.f, 1.f);
 
-        for (int depth = 0; depth < params.max_depth; depth++) {
+    for (int depth = 0; depth < params.max_depth; depth++) {
 
-            // p0-p2   radiance (CH writes emission)
-            // p3-p5   albedo   (CH writes albedo of all matType)
-            // p6      bsdfPdf  (CH writes 0u, not needed for gathering)
-            // p7-p9   hitpos   (CH writes)
-            // p10-p12 normal   (CH writes, face-forward)
-            // p13     matType[7:0] | outsideFlag[8]
-            // p14     mat_id
-            // p15     done (0=hit, 1=miss)
-            unsigned int p0 = 0u, p1 = 0u, p2 = 0u;
-            unsigned int p3 = __float_as_uint(1.f); // throughput.x -> CH reads for emission MIS
-            unsigned int p4 = __float_as_uint(1.f); // throughput.y
-            unsigned int p5 = __float_as_uint(1.f); // throughput.z
-            unsigned int p6 = 0u; // nextBsdfPdf = 0 -> CH gives full emission weight
-            unsigned int p7 = 0u, p8 = 0u, p9 = 0u;
-            unsigned int p10 = 0u, p11 = 0u, p12 = 0u;
-            unsigned int p13 = 0u, p14 = 0u, p15 = 0u;
+        // p0-p2   radiance (CH writes emission)
+        // p3-p5   albedo   (CH writes albedo of all matType)
+        // p6      bsdfPdf  (CH writes 0u, not needed for gathering)
+        // p7-p9   hitpos   (CH writes)
+        // p10-p12 normal   (CH writes, face-forward)
+        // p13     matType[7:0] | outsideFlag[8]
+        // p14     mat_id
+        // p15     done (0=hit, 1=miss)
+        unsigned int p0 = 0u, p1 = 0u, p2 = 0u;
+        unsigned int p3 = __float_as_uint(1.f); // throughput.x -> CH reads for emission MIS
+        unsigned int p4 = __float_as_uint(1.f); // throughput.y
+        unsigned int p5 = __float_as_uint(1.f); // throughput.z
+        unsigned int p6 = 0u; // nextBsdfPdf = 0 -> CH gives full emission weight
+        unsigned int p7 = 0u, p8 = 0u, p9 = 0u;
+        unsigned int p10 = 0u, p11 = 0u, p12 = 0u;
+        unsigned int p13 = 0u, p14 = 0u, p15 = 0u;
 
-            optixTrace(params.handle, origin, dir,
-                params.scene_epsilon, 1e16f, 0.f,
-                OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
-                0, 1, 0,
-                p0, p1, p2, p3, p4, p5,
-                p6, p7, p8, p9, p10, p11,
-                p12, p13, p14, p15);
+        optixTrace(params.handle, origin, dir,
+            params.scene_epsilon, 1e16f, 0.f,
+            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
+            0, 1, 0,
+            p0, p1, p2, p3, p4, p5,
+            p6, p7, p8, p9, p10, p11,
+            p12, p13, p14, p15);
 
-            if (p15 == 1u) {
-                // Miss —> sky (CH/miss calculates sky radiance in p0-p2 with throughput=1)
-                result += path_throughput * make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
-                break;
-            }
-
-            // Read payload
-            unsigned int matType = p13 & 0xFFu;
-            bool outsideFlag = (p13 >> 8u) & 1u;
-            unsigned int mat_id = p14;
-
-            float3 hitpos = make_float3(__uint_as_float(p7),
-                __uint_as_float(p8),
-                __uint_as_float(p9));
-            float3 n = make_float3(__uint_as_float(p10),
-                __uint_as_float(p11),
-                __uint_as_float(p12));
-            float3 albedo = make_float3(__uint_as_float(p3),
-                __uint_as_float(p4),
-                __uint_as_float(p5));
-
-            // Emission from light source (CH wrote to p0-p2 with throughput=1)
-            float3 emission = make_float3(__uint_as_float(p0),
-                __uint_as_float(p1),
-                __uint_as_float(p2));
-            result += path_throughput * emission;
-
-            if (matType == MAT_DIFFUSE) {
-                // Direct light by next-event estimation.  Skipped when the map
-                // was told to carry the direct photons itself, otherwise the
-                // two would double-count each other.
-                if (!params.store_direct_photons)
-                    result += path_throughput * directLighting(hitpos, n, albedo, rng);
-
-                // Indirect light (and caustics) from the photon map.
-                //
-                // The camera walk has spent `depth + 1` vertices to get here
-                // (specular bounces included), and a photon stored at its own
-                // bounce j carries j + 1 vertices of which the last one is this
-                // very point.  The finished path therefore has j + depth + 1
-                // vertices, and the path tracer would have allowed at most
-                // max_depth of them — so a photon may contribute only while
-                //
-                //     j + depth + 1 <= max_depth.
-                //
-                // At depth 0 that admits photons up to j = max_depth-1, exactly
-                // matching a path-traced v1..v_D; at depth = max_depth-1 it
-                // admits none, matching a path tracer left with only its final
-                // shadow ray.  Without this the two budgets are independent and
-                // photon mapping quietly integrates far longer paths.
-                int maxPhotonDepth = params.max_depth - 1 - depth;
-                float usedRadius;
-                float3 irradiance = photonIrradiance(hitpos, n, maxPhotonDepth,
-                    usedRadius);
-
-                // Lambertian BRDF
-                result += path_throughput * albedo * irradiance * M_1_PIf;
-                break; // PM: only first diffuse bounce
-
-            } else if (matType == MAT_MIRROR) {
-                path_throughput = path_throughput * albedo;
-                dir = normalize(dir - 2.f * dot(dir, n) * n);
-                origin = hitpos + params.scene_epsilon * dir;
-
-            } else { // MAT_GLASS
-                float ior = params.materials[mat_id].ior;
-                float eta = outsideFlag ? (1.f / ior) : ior;
-                float cosT = fabsf(dot(-dir, n));
-                float fr = schlick(cosT, ior);
-                float3 newdir;
-                bool doRefl = !refractDir(dir, n, eta, newdir);
-                if (!doRefl)
-                    doRefl = (randf(rng) < fr);
-                if (doRefl) {
-                    newdir = normalize(dir - 2.f * dot(dir, n) * n);
-                } else {
-                    // The gather walk carries radiance just like the path
-                    // tracer's, and this is the half of the photon-mapped path
-                    // that crosses the boundary an odd number of times when the
-                    // photon sits inside the glass.  See the note above
-                    // refractDir.
-                    path_throughput = path_throughput * (eta * eta);
-                }
-                dir = newdir;
-                origin = hitpos + params.scene_epsilon * dir;
-            }
+        if (p15 == 1u) {
+            // Miss —> sky (CH/miss calculates sky radiance in p0-p2 with throughput=1)
+            result += path_throughput * make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
+            break;
         }
 
-        result_over_samples += result;
+        // Read payload
+        unsigned int matType = p13 & 0xFFu;
+        bool outsideFlag = (p13 >> 8u) & 1u;
+        unsigned int mat_id = p14;
+
+        float3 hitpos = make_float3(__uint_as_float(p7),
+            __uint_as_float(p8),
+            __uint_as_float(p9));
+        float3 n = make_float3(__uint_as_float(p10),
+            __uint_as_float(p11),
+            __uint_as_float(p12));
+        float3 albedo = make_float3(__uint_as_float(p3),
+            __uint_as_float(p4),
+            __uint_as_float(p5));
+
+        // Emission from light source (CH wrote to p0-p2 with throughput=1)
+        float3 emission = make_float3(__uint_as_float(p0),
+            __uint_as_float(p1),
+            __uint_as_float(p2));
+        result += path_throughput * emission;
+
+        if (matType == MAT_DIFFUSE) {
+            // Direct light by next-event estimation.  Skipped when the map
+            // was told to carry the direct photons itself, otherwise the
+            // two would double-count each other.
+            if (!params.store_direct_photons)
+                result += path_throughput * directLighting(hitpos, n, albedo, rng);
+
+            // Indirect light (and caustics) come from the photon map — but the
+            // lookup is the query pass's job.  All this pass leaves behind is
+            // where to look and what to multiply the irradiance by: the
+            // Lambertian BRDF, albedo/pi, times the throughput that reached
+            // this vertex.
+            gp.pos = hitpos;
+            gp.normal = n;
+            gp.weight = path_throughput * albedo * M_1_PIf;
+
+            // The camera walk has spent `depth + 1` vertices to get here
+            // (specular bounces included), and a photon stored at its own
+            // bounce j carries j + 1 vertices of which the last one is this
+            // very point.  The finished path therefore has j + depth + 1
+            // vertices, and the path tracer would have allowed at most
+            // max_depth of them — so a photon may contribute only while
+            //
+            //     j + depth + 1 <= max_depth.
+            //
+            // At depth 0 that admits photons up to j = max_depth-1, exactly
+            // matching a path-traced v1..v_D; at depth = max_depth-1 it
+            // admits none, matching a path tracer left with only its final
+            // shadow ray.  Without this the two budgets are independent and
+            // photon mapping quietly integrates far longer paths.
+            gp.max_photon_depth = params.max_depth - 1 - depth;
+            gp.valid = 1;
+            break; // PM: only first diffuse bounce
+
+        } else if (matType == MAT_MIRROR) {
+            path_throughput = path_throughput * albedo;
+            dir = normalize(dir - 2.f * dot(dir, n) * n);
+            origin = hitpos + params.scene_epsilon * dir;
+
+        } else { // MAT_GLASS
+            float ior = params.materials[mat_id].ior;
+            float eta = outsideFlag ? (1.f / ior) : ior;
+            float cosT = fabsf(dot(-dir, n));
+            float fr = schlick(cosT, ior);
+            float3 newdir;
+            bool doRefl = !refractDir(dir, n, eta, newdir);
+            if (!doRefl)
+                doRefl = (randf(rng) < fr);
+            if (doRefl) {
+                newdir = normalize(dir - 2.f * dot(dir, n) * n);
+            } else {
+                // The gather walk carries radiance just like the path
+                // tracer's, and this is the half of the photon-mapped path
+                // that crosses the boundary an odd number of times when the
+                // photon sits inside the glass.  See the note above
+                // refractDir.
+                path_throughput = path_throughput * (eta * eta);
+            }
+            dir = newdir;
+            origin = hitpos + params.scene_epsilon * dir;
+        }
     }
 
-    result_over_samples.x /= params.samples_per_pixel;
-    result_over_samples.y /= params.samples_per_pixel;
-    result_over_samples.z /= params.samples_per_pixel;
+    gp.direct = result;
 
-    // Temporal accumulation
-    float3 prev = (params.frame_index == 0)
-        ? make_float3(0.f, 0.f, 0.f)
-        : params.accum_buffer[pixel];
-    float3 acc = make_float3(prev.x + result_over_samples.x,
-        prev.y + result_over_samples.y,
-        prev.z + result_over_samples.z);
-    params.accum_buffer[pixel] = acc;
+    params.gather_points[pixel] = gp;
+}
 
-    float nf = float(params.frame_index + 1);
-    float3 mean = make_float3(acc.x / nf, acc.y / nf, acc.z / nf);
-    mean.x = sqrtf(fminf(fmaxf(mean.x, 0.f), 1.f));
-    mean.y = sqrtf(fminf(fmaxf(mean.y, 0.f), 1.f));
-    mean.z = sqrtf(fminf(fmaxf(mean.z, 0.f), 1.f));
-    params.frame_buffer[pixel] = make_uchar4(
-        (unsigned char)(mean.x * 255.f),
-        (unsigned char)(mean.y * 255.f),
-        (unsigned char)(mean.z * 255.f), 255u);
+// Pass 2 of the gather: the photon lookup, and nothing else.
+//
+// This is the launch the acceleration structures are compared on, so it is kept
+// deliberately bare — read the gather point, ask the photon map for irradiance,
+// write the pixel's radiance.  Accumulation and tone mapping happen afterwards
+// in a plain CUDA kernel so that they stay out of the measurement, and so that
+// this pass can be run twice over one photon map (grid against brute force)
+// without the two runs accumulating on top of each other.
+extern "C" __global__ void __raygen__query()
+{
+    const uint3 idx = optixGetLaunchIndex();
+    const int pixel = idx.y * params.width + idx.x;
+
+    const GatherPoint gp = params.gather_points[pixel];
+    float3 radiance = gp.direct;
+
+    if (gp.valid) {
+        float usedRadius;
+        float3 irradiance = photonIrradiance(gp.pos, gp.normal,
+            gp.max_photon_depth, usedRadius);
+        radiance += gp.weight * irradiance;
+    }
+
+    params.query_radiance[pixel] = radiance;
 }
 
 // Closesthit — geometry + emission only, NO BxDF logic

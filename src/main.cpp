@@ -1,3 +1,4 @@
+#include "cuda_passes.h"
 #include "params.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -55,7 +56,7 @@ static bool gFirstMouse = true;
 static float gYaw;
 static float gPitch;
 static bool gGuiMode = false;
-static constexpr size_t kMaxPhotonSlots = 32'000'000;   // 32M * 40B = 1.28 GB
+static constexpr size_t kMaxPhotonSlots = 32'000'000;   // 32M * 52B = 1.66 GB
 
 
 // Mouse callback to control camera orientation. Updates gYaw and gPitch based on mouse movement, and sets gCameraChanged to true when the camera is updated
@@ -205,7 +206,8 @@ struct RendererState {
     OptixProgramGroup shadowMissGroup = nullptr; // shadow miss
     OptixProgramGroup hitGroup = nullptr;
     OptixProgramGroup photonRaygenGroup = nullptr;
-    OptixProgramGroup gatherRaygenGroup = nullptr;
+    OptixProgramGroup cameraRaygenGroup = nullptr; // gather pass 1
+    OptixProgramGroup queryRaygenGroup = nullptr; // gather pass 2
 
     OptixPipeline pipeline = nullptr;
     OptixShaderBindingTable sbt = {};
@@ -219,11 +221,15 @@ struct RendererState {
     CUdeviceptr dParams = 0;
 
     CUdeviceptr drg_photon = 0;
-    CUdeviceptr drg_gather = 0;
+    CUdeviceptr drg_camera = 0;
+    CUdeviceptr drg_query = 0;
 
-    CUdeviceptr dGridCellStart = 0;
-    CUdeviceptr dGridCellCount = 0;
-    CUdeviceptr dGridPhotonIds = 0;
+    // Working memory for the photon-grid build (device side, see cuda_passes.h)
+    GridScratch grid;
+
+    // Split-gather buffers, one entry per pixel
+    CUdeviceptr dGatherPoints = 0;
+    CUdeviceptr dQueryRadiance = 0;
 
     uint32_t numVertices = 0;
     uint32_t numMaterials = 0;
@@ -329,6 +335,17 @@ struct RunArgs {
     float finalRadius = -1.f;
     std::string cameraFile = "camera.txt";
     std::string outputFile = "../build/output.exr";
+
+    // Offline resolution.  0 = keep the default; small frames are what make a
+    // brute-force comparison run affordable.
+    int width = 0;
+    int height = 0;
+
+    // Gather-side switches, all aimed at the acceleration-structure comparison.
+    std::string accel = "grid"; // grid | hash | brute — structure the gather searches
+    bool verifyGather = false; // run every query pass twice, structure vs brute force
+    int warmupFrames = 1; // frames left out of the timing summary
+    std::string timingJson; // where to write the per-frame pass timings
 };
 
 static RunArgs parseArgs(int argc, char** argv) {
@@ -369,6 +386,19 @@ static RunArgs parseArgs(int argc, char** argv) {
             args.cameraFile = argv[++i];
         } else if (a == "--output" && i + 1 < argc) {
             args.outputFile = argv[++i];
+        } else if (a == "--res" && i + 2 < argc) {
+            args.width = std::max(1, atoi(argv[++i]));
+            args.height = std::max(1, atoi(argv[++i]));
+        } else if (a == "--accel" && i + 1 < argc) {
+            args.accel = argv[++i];
+        } else if (a == "--brute-force") {
+            args.accel = "brute"; // kept as a shorthand for --accel brute
+        } else if (a == "--verify-gather") {
+            args.verifyGather = true;
+        } else if (a == "--warmup" && i + 1 < argc) {
+            args.warmupFrames = std::max(0, atoi(argv[++i]));
+        } else if (a == "--timing-json" && i + 1 < argc) {
+            args.timingJson = argv[++i];
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "Unknown option: " << a << "\n"
                       << "If this option was added recently, the binary is out "
@@ -613,6 +643,8 @@ void computeSceneBounds(const Scene& scene, Params& p)
         p.scene_center = make_float3(0.f, 0.f, 0.f);
         p.scene_radius = 1.f;
         p.scene_epsilon = 1e-3f;
+        p.scene_aabb_min = make_float3(-1.f, -1.f, -1.f);
+        p.scene_aabb_max = make_float3(1.f, 1.f, 1.f);
         return;
     }
 
@@ -635,6 +667,9 @@ void computeSceneBounds(const Scene& scene, Params& p)
     p.scene_center = make_float3(0.5f * (bmin.x + bmax.x),
         0.5f * (bmin.y + bmax.y),
         0.5f * (bmin.z + bmax.z));
+    // Kept, not just reduced to a sphere: the photon grid bins against this box.
+    p.scene_aabb_min = bmin;
+    p.scene_aabb_max = bmax;
 
     float dx = bmax.x - bmin.x, dy = bmax.y - bmin.y, dz = bmax.z - bmin.z;
     float diag = std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -858,13 +893,21 @@ void createProgramGroups(RendererState& state)
     OPTIX_CHECK(optixProgramGroupCreate(state.context, &photonRd, 1, &pgo,
         log, &ls, &state.photonRaygenGroup));
 
-    // Gather raygen
-    OptixProgramGroupDesc gatherRd = {};
-    gatherRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-    gatherRd.raygen.module = state.ptxModule;
-    gatherRd.raygen.entryFunctionName = "__raygen__gather";
-    OPTIX_CHECK(optixProgramGroupCreate(state.context, &gatherRd, 1, &pgo,
-        log, &ls, &state.gatherRaygenGroup));
+    // Gather pass 1 — camera walk
+    OptixProgramGroupDesc cameraRd = {};
+    cameraRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    cameraRd.raygen.module = state.ptxModule;
+    cameraRd.raygen.entryFunctionName = "__raygen__camera";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &cameraRd, 1, &pgo,
+        log, &ls, &state.cameraRaygenGroup));
+
+    // Gather pass 2 — photon lookup
+    OptixProgramGroupDesc queryRd = {};
+    queryRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    queryRd.raygen.module = state.ptxModule;
+    queryRd.raygen.entryFunctionName = "__raygen__query";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &queryRd, 1, &pgo,
+        log, &ls, &state.queryRaygenGroup));
 
     // Light visualization raygen
     OptixProgramGroupDesc lightvisRd = {};
@@ -888,7 +931,8 @@ void createPipeline(RendererState& state)
         state.shadowMissGroup,
         state.hitGroup,
         state.photonRaygenGroup,
-        state.gatherRaygenGroup,
+        state.cameraRaygenGroup,
+        state.queryRaygenGroup,
         state.lightvisRaygenGroup
     };
 
@@ -913,7 +957,8 @@ void createPipeline(RendererState& state)
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.shadowMissGroup, &ss, state.pipeline));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.hitGroup, &ss, state.pipeline));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.photonRaygenGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.gatherRaygenGroup, &ss, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.cameraRaygenGroup, &ss, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.queryRaygenGroup, &ss, state.pipeline));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.lightvisRaygenGroup, &ss, state.pipeline));
 
     uint32_t fromTraversal, fromState, continuation;
@@ -1012,12 +1057,18 @@ void createSBT(RendererState& state)
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_photon),
         &rgPhoton, sizeof(rgPhoton), cudaMemcpyHostToDevice));
 
-    // Gather raygen SBT record
-    SbtRecord<RayGenData> rgGather = {};
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.gatherRaygenGroup, &rgGather));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_gather), sizeof(rgGather)));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_gather),
-        &rgGather, sizeof(rgGather), cudaMemcpyHostToDevice));
+    // Gather raygen SBT records — one per pass
+    SbtRecord<RayGenData> rgCamera = {};
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.cameraRaygenGroup, &rgCamera));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_camera), sizeof(rgCamera)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_camera),
+        &rgCamera, sizeof(rgCamera), cudaMemcpyHostToDevice));
+
+    SbtRecord<RayGenData> rgQuery = {};
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.queryRaygenGroup, &rgQuery));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_query), sizeof(rgQuery)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_query),
+        &rgQuery, sizeof(rgQuery), cudaMemcpyHostToDevice));
 
     // Light visualization raygen SBT record
     SbtRecord<RayGenData> rgLightvis = {};
@@ -1126,147 +1177,155 @@ static void updatePPMRadius(Params& p)
         p.gather_radius = ppmRadius(p.ppm_radius_initial, p.ppm_alpha, p.frame_index);
 }
 
-void buildPhotonGrid(Params& params,
-    CUdeviceptr& dGridCellStart,
-    CUdeviceptr& dGridCellCount,
-    CUdeviceptr& dGridPhotonIds)
-{
-    // get photon count from GPU
-    int storedCount = 0;
-    CUDA_CHECK(cudaMemcpy(&storedCount, params.photon_count,
-        sizeof(int), cudaMemcpyDeviceToHost));
-    storedCount = std::min(storedCount, params.photon_capacity);
-
-    if (storedCount == 0) {
-        params.use_grid = 0;
-        return;
-    }
-
-    std::vector<Photon> hostPhotons(storedCount);
-    CUDA_CHECK(cudaMemcpy(hostPhotons.data(), params.photon_map,
-        storedCount * sizeof(Photon),
-        cudaMemcpyDeviceToHost));
-
-    // AABB bounds of all photons
-    float3 bmin = hostPhotons[0].pos;
-    float3 bmax = hostPhotons[0].pos;
-    for (int i = 1; i < storedCount; ++i) {
-        const float3& p = hostPhotons[i].pos;
-        bmin.x = std::min(bmin.x, p.x);
-        bmax.x = std::max(bmax.x, p.x);
-        bmin.y = std::min(bmin.y, p.y);
-        bmax.y = std::max(bmax.y, p.y);
-        bmin.z = std::min(bmin.z, p.z);
-        bmax.z = std::max(bmax.z, p.z);
-    }
-    // one cell extra in each direction to avoid boundary issues
-    float r = params.gather_radius;
-    bmin.x -= r;
-    bmin.y -= r;
-    bmin.z -= r;
-    bmax.x += r;
-    bmax.y += r;
-    bmax.z += r;
-
-    // The grid is binned at `cs`, normally the gather radius itself.  The axis
-    // count is capped, and the cap has to be absorbed by *growing the cell*
-    // rather than by clamping dims alone: the host below clamps an out-of-range
-    // photon into the edge cell, while the device derives its index from
-    // grid.cell_size and skips anything outside dims, so if the two disagree the
-    // gather silently loses photons.  Growing cs instead keeps them consistent
-    // and stays correct, because the device's 3x3x3 walk covers the search
-    // sphere for any cs >= r (it is only slower, more photons per cell to test).
-    //
-    // This matters now that the PPM schedule shrinks r every frame: cell count
-    // grows as r^-3, so a factor-3 radius reduction is 27x the cells.
-    const int kMaxCellsPerAxis = 1024;
-    const float extX = bmax.x - bmin.x, extY = bmax.y - bmin.y, extZ = bmax.z - bmin.z;
-    float cs = r;
-    cs = std::max(cs, extX / kMaxCellsPerAxis);
-    cs = std::max(cs, extY / kMaxCellsPerAxis);
-    cs = std::max(cs, extZ / kMaxCellsPerAxis);
-
-    // grid dimensions (number of cells in each direction)
-    int3 dims;
-    dims.x = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extX / cs)));
-    dims.y = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extY / cs)));
-    dims.z = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extZ / cs)));
-
-    int totalCells = dims.x * dims.y * dims.z;
-    std::cout << "[PhotonGrid] dims = " << dims.x << "x" << dims.y << "x" << dims.z
-              << "  cells = " << totalCells
-              << "  photons = " << storedCount << "\n";
-
-    // Count photons in each cell
-    auto cellIndex = [&](float3 pos) -> int {
-        int ix = (int)std::floor((pos.x - bmin.x) / cs);
-        int iy = (int)std::floor((pos.y - bmin.y) / cs);
-        int iz = (int)std::floor((pos.z - bmin.z) / cs);
-        ix = std::max(0, std::min(ix, dims.x - 1));
-        iy = std::max(0, std::min(iy, dims.y - 1));
-        iz = std::max(0, std::min(iz, dims.z - 1));
-        return iz * dims.y * dims.x + iy * dims.x + ix;
-    };
-
-    std::vector<int> cellCount(totalCells, 0);
-    for (int i = 0; i < storedCount; ++i)
-        cellCount[cellIndex(hostPhotons[i].pos)]++;
-
-    // Prefix sum -> cell_start
-    std::vector<int> cellStart(totalCells, 0);
-    for (int c = 1; c < totalCells; ++c)
-        cellStart[c] = cellStart[c - 1] + cellCount[c - 1];
-
-    // Filling grid_photon_ids
-    std::vector<int> gridPhotonIds(storedCount);
-    std::vector<int> insertCursor(cellStart); // копия для записи
-
-    for (int i = 0; i < storedCount; ++i) {
-        int c = cellIndex(hostPhotons[i].pos);
-        gridPhotonIds[insertCursor[c]++] = i;
-    }
-
-    // Upload to GPU.  This runs once per frame now, so the buffers are kept
-    // and only grown when they no longer fit.
-    // One capacity per buffer — sharing a counter between two pointers would let
-    // the second one skip a realloc it actually needed.
-    static size_t startCapacity = 0;
-    static size_t countCapacity = 0;
-    static size_t idCapacity = 0;
-
-    auto ensure = [](CUdeviceptr& ptr, size_t& capacity, size_t needed) {
-        if (ptr && capacity >= needed)
-            return;
-        if (ptr)
-            CUDA_CHECK(cudaFree(reinterpret_cast<void*>(ptr)));
-        capacity = needed + needed / 4; // a little headroom
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr), capacity * sizeof(int)));
-    };
-
-    ensure(dGridCellStart, startCapacity, (size_t)totalCells);
-    ensure(dGridCellCount, countCapacity, (size_t)totalCells);
-    ensure(dGridPhotonIds, idCapacity, (size_t)storedCount);
-
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellStart),
-        cellStart.data(), totalCells * sizeof(int),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellCount),
-        cellCount.data(), totalCells * sizeof(int),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridPhotonIds),
-        gridPhotonIds.data(), storedCount * sizeof(int),
-        cudaMemcpyHostToDevice));
-
-    // Update params
-    params.grid.aabb_min = bmin;
-    params.grid.aabb_max = bmax;
-    params.grid.dims = dims;
-    params.grid.cell_size = cs;
-    params.grid.cell_start = reinterpret_cast<int*>(dGridCellStart);
-    params.grid.cell_count = reinterpret_cast<int*>(dGridCellCount);
-    params.grid.grid_photon_ids = reinterpret_cast<int*>(dGridPhotonIds);
-    params.use_grid = 1;
-}
+// The host-side grid build this replaced.  Kept, commented, because it is the
+// reference the GPU build was checked against: CUB's radix sort is stable and
+// the photon ids go in ascending, so it groups a cell's photons in exactly the
+// order this counting sort did.  What it cost was the thing worth removing —
+// the whole photon map came back over PCIe every frame, three host passes ran
+// over it, and the result went back up again, all of it per frame because PPM
+// rebuilds the grid every frame.  See buildPhotonGridGPU in cuda_passes.cu.
+//
+// void buildPhotonGrid(Params& params,
+//     CUdeviceptr& dGridCellStart,
+//     CUdeviceptr& dGridCellCount,
+//     CUdeviceptr& dGridPhotonIds)
+// {
+//     // get photon count from GPU
+//     int storedCount = 0;
+//     CUDA_CHECK(cudaMemcpy(&storedCount, params.photon_count,
+//         sizeof(int), cudaMemcpyDeviceToHost));
+//     storedCount = std::min(storedCount, params.photon_capacity);
+//
+//     if (storedCount == 0) {
+//         params.use_grid = 0;
+//         return;
+//     }
+//
+//     std::vector<Photon> hostPhotons(storedCount);
+//     CUDA_CHECK(cudaMemcpy(hostPhotons.data(), params.photon_map,
+//         storedCount * sizeof(Photon),
+//         cudaMemcpyDeviceToHost));
+//
+//     // AABB bounds of all photons
+//     float3 bmin = hostPhotons[0].pos;
+//     float3 bmax = hostPhotons[0].pos;
+//     for (int i = 1; i < storedCount; ++i) {
+//         const float3& p = hostPhotons[i].pos;
+//         bmin.x = std::min(bmin.x, p.x);
+//         bmax.x = std::max(bmax.x, p.x);
+//         bmin.y = std::min(bmin.y, p.y);
+//         bmax.y = std::max(bmax.y, p.y);
+//         bmin.z = std::min(bmin.z, p.z);
+//         bmax.z = std::max(bmax.z, p.z);
+//     }
+//     // one cell extra in each direction to avoid boundary issues
+//     float r = params.gather_radius;
+//     bmin.x -= r;
+//     bmin.y -= r;
+//     bmin.z -= r;
+//     bmax.x += r;
+//     bmax.y += r;
+//     bmax.z += r;
+//
+//     // The grid is binned at `cs`, normally the gather radius itself.  The axis
+//     // count is capped, and the cap has to be absorbed by *growing the cell*
+//     // rather than by clamping dims alone: the host below clamps an out-of-range
+//     // photon into the edge cell, while the device derives its index from
+//     // grid.cell_size and skips anything outside dims, so if the two disagree the
+//     // gather silently loses photons.  Growing cs instead keeps them consistent
+//     // and stays correct, because the device's 3x3x3 walk covers the search
+//     // sphere for any cs >= r (it is only slower, more photons per cell to test).
+//     //
+//     // This matters now that the PPM schedule shrinks r every frame: cell count
+//     // grows as r^-3, so a factor-3 radius reduction is 27x the cells.
+//     const int kMaxCellsPerAxis = 1024;
+//     const float extX = bmax.x - bmin.x, extY = bmax.y - bmin.y, extZ = bmax.z - bmin.z;
+//     float cs = r;
+//     cs = std::max(cs, extX / kMaxCellsPerAxis);
+//     cs = std::max(cs, extY / kMaxCellsPerAxis);
+//     cs = std::max(cs, extZ / kMaxCellsPerAxis);
+//
+//     // grid dimensions (number of cells in each direction)
+//     int3 dims;
+//     dims.x = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extX / cs)));
+//     dims.y = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extY / cs)));
+//     dims.z = std::min(kMaxCellsPerAxis, std::max(1, (int)std::ceil(extZ / cs)));
+//
+//     int totalCells = dims.x * dims.y * dims.z;
+//     std::cout << "[PhotonGrid] dims = " << dims.x << "x" << dims.y << "x" << dims.z
+//               << "  cells = " << totalCells
+//               << "  photons = " << storedCount << "\n";
+//
+//     // Count photons in each cell
+//     auto cellIndex = [&](float3 pos) -> int {
+//         int ix = (int)std::floor((pos.x - bmin.x) / cs);
+//         int iy = (int)std::floor((pos.y - bmin.y) / cs);
+//         int iz = (int)std::floor((pos.z - bmin.z) / cs);
+//         ix = std::max(0, std::min(ix, dims.x - 1));
+//         iy = std::max(0, std::min(iy, dims.y - 1));
+//         iz = std::max(0, std::min(iz, dims.z - 1));
+//         return iz * dims.y * dims.x + iy * dims.x + ix;
+//     };
+//
+//     std::vector<int> cellCount(totalCells, 0);
+//     for (int i = 0; i < storedCount; ++i)
+//         cellCount[cellIndex(hostPhotons[i].pos)]++;
+//
+//     // Prefix sum -> cell_start
+//     std::vector<int> cellStart(totalCells, 0);
+//     for (int c = 1; c < totalCells; ++c)
+//         cellStart[c] = cellStart[c - 1] + cellCount[c - 1];
+//
+//     // Filling grid_photon_ids
+//     std::vector<int> gridPhotonIds(storedCount);
+//     std::vector<int> insertCursor(cellStart); // копия для записи
+//
+//     for (int i = 0; i < storedCount; ++i) {
+//         int c = cellIndex(hostPhotons[i].pos);
+//         gridPhotonIds[insertCursor[c]++] = i;
+//     }
+//
+//     // Upload to GPU.  This runs once per frame now, so the buffers are kept
+//     // and only grown when they no longer fit.
+//     // One capacity per buffer — sharing a counter between two pointers would let
+//     // the second one skip a realloc it actually needed.
+//     static size_t startCapacity = 0;
+//     static size_t countCapacity = 0;
+//     static size_t idCapacity = 0;
+//
+//     auto ensure = [](CUdeviceptr& ptr, size_t& capacity, size_t needed) {
+//         if (ptr && capacity >= needed)
+//             return;
+//         if (ptr)
+//             CUDA_CHECK(cudaFree(reinterpret_cast<void*>(ptr)));
+//         capacity = needed + needed / 4; // a little headroom
+//         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr), capacity * sizeof(int)));
+//     };
+//
+//     ensure(dGridCellStart, startCapacity, (size_t)totalCells);
+//     ensure(dGridCellCount, countCapacity, (size_t)totalCells);
+//     ensure(dGridPhotonIds, idCapacity, (size_t)storedCount);
+//
+//     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellStart),
+//         cellStart.data(), totalCells * sizeof(int),
+//         cudaMemcpyHostToDevice));
+//     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridCellCount),
+//         cellCount.data(), totalCells * sizeof(int),
+//         cudaMemcpyHostToDevice));
+//     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(dGridPhotonIds),
+//         gridPhotonIds.data(), storedCount * sizeof(int),
+//         cudaMemcpyHostToDevice));
+//
+//     // Update params
+//     params.grid.aabb_min = bmin;
+//     params.grid.aabb_max = bmax;
+//     params.grid.dims = dims;
+//     params.grid.cell_size = cs;
+//     params.grid.cell_start = reinterpret_cast<int*>(dGridCellStart);
+//     params.grid.cell_count = reinterpret_cast<int*>(dGridCellCount);
+//     params.grid.grid_photon_ids = reinterpret_cast<int*>(dGridPhotonIds);
+//     params.use_grid = 1;
+// }
 
 static bool saveEXR(const std::string& filename,
                     const std::vector<float3>& hdr,
@@ -1336,6 +1395,108 @@ static bool saveEXR(const std::string& filename,
     return true;
 }
 
+// Per-pass timing.
+//
+// The events are timestamps on the stream, so what they measure is the wall
+// clock between two points of the frame — device work and any gap where the GPU
+// sat waiting for the host to enqueue the next piece.  That is the honest
+// number for a structure that is rebuilt every frame: the build's host side is
+// part of its cost.
+struct GpuTimer {
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end = nullptr;
+
+    void init()
+    {
+        if (!begin) {
+            CUDA_CHECK(cudaEventCreate(&begin));
+            CUDA_CHECK(cudaEventCreate(&end));
+        }
+    }
+    void start(CUstream stream)
+    {
+        init();
+        CUDA_CHECK(cudaEventRecord(begin, stream));
+    }
+    float stopMs(CUstream stream)
+    {
+        CUDA_CHECK(cudaEventRecord(end, stream));
+        CUDA_CHECK(cudaEventSynchronize(end));
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, begin, end));
+        return ms;
+    }
+    void destroy()
+    {
+        if (begin) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            begin = end = nullptr;
+        }
+    }
+};
+
+// One frame's worth of measurements, in milliseconds.
+struct FrameTimings {
+    float photon_trace = 0.f;
+    float build = 0.f; // acceleration-structure build
+    float camera = 0.f;
+    float query = 0.f;
+    float accum = 0.f;
+    float radius = 0.f;
+    long long cells = 0; // uniform grid only
+    long long buckets = 0; // hash grid only
+    int photons = 0;
+    float total() const { return photon_trace + build + camera + query + accum; }
+};
+
+// The structure the gather searches the photon map with, set by --accel or the
+// GUI.  params.accel is what the device actually uses for a given frame; it is
+// this value except when there are no photons to build over, and except while
+// --verify-gather runs its brute-force reference.
+//
+// ACCEL_BRUTE_FORCE builds nothing and tests every photon in the map.  It is
+// slow by construction: it is the reference the structures are checked against.
+static AccelType gAccel = ACCEL_UNIFORM_GRID;
+
+static const char* accelName(AccelType a)
+{
+    switch (a) {
+    case ACCEL_BRUTE_FORCE:
+        return "brute";
+    case ACCEL_HASH_GRID:
+        return "hash";
+    default:
+        return "grid";
+    }
+}
+
+static const char* accelLabel(AccelType a)
+{
+    switch (a) {
+    case ACCEL_BRUTE_FORCE:
+        return "brute force";
+    case ACCEL_HASH_GRID:
+        return "hash grid";
+    default:
+        return "uniform grid";
+    }
+}
+
+static bool parseAccel(const std::string& s, AccelType& out)
+{
+    if (s == "grid") {
+        out = ACCEL_UNIFORM_GRID;
+    } else if (s == "hash") {
+        out = ACCEL_HASH_GRID;
+    } else if (s == "brute") {
+        out = ACCEL_BRUTE_FORCE;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 void launchPathTracing(RendererState& state, Params& p, CUstream& stream) {
     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
                                 &p, sizeof(Params),
@@ -1365,8 +1526,12 @@ static bool tracePhotonsOnce(RendererState& state, Params& p, CUstream stream, i
 
 // Traces one full photon pass and rebuilds the lookup grid.
 // Returns the number of photons actually stored.
-int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream)
+int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream,
+    FrameTimings* timings = nullptr)
 {
+    static GpuTimer traceTimer, buildTimer;
+
+    traceTimer.start(stream);
     int deposits = 0;
     if (!tracePhotonsOnce(state, p, stream, deposits)) {
         size_t need = size_t(deposits * 1.2) + 1024;
@@ -1380,10 +1545,51 @@ int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream)
         if (!tracePhotonsOnce(state, p, stream, deposits))
             std::cerr << "[Photons] STILL saturated — lower num_photon_paths\n";
     }
-    buildPhotonGrid(p, state.dGridCellStart, state.dGridCellCount, state.dGridPhotonIds);
+    const float traceMs = traceTimer.stopMs(stream);
+
+    const int stored = std::min(deposits, p.photon_capacity);
+
+    float buildMs = 0.f;
+    GridBuildStats stats;
+    if (gAccel == ACCEL_BRUTE_FORCE) {
+        p.accel = ACCEL_BRUTE_FORCE;
+    } else if (gAccel == ACCEL_HASH_GRID) {
+        buildTimer.start(stream);
+        buildPhotonHashGridGPU(p, stored, state.grid, stream, &stats);
+        buildMs = buildTimer.stopMs(stream);
+    } else {
+        buildTimer.start(stream);
+        buildPhotonGridGPU(p, stored, state.grid, stream, &stats);
+        buildMs = buildTimer.stopMs(stream);
+
+        // The cell budget is a silent change of what is being measured, so say
+        // when it engages — but only when it changes, or a long render would
+        // print it once per frame.
+        static bool wasCapped = false;
+        if (stats.cell_size_capped != wasCapped) {
+            wasCapped = stats.cell_size_capped;
+            if (wasCapped)
+                std::cout << "\n[PhotonGrid] cell budget reached: cell size "
+                          << stats.cell_size << " > r = " << stats.radius
+                          << " (x" << (stats.cell_size / std::max(stats.radius, 1e-9f))
+                          << ") — the gather now walks wider cells\n";
+            else
+                std::cout << "\n[PhotonGrid] cell size back at the gather radius\n";
+        }
+    }
+
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params),
                           cudaMemcpyHostToDevice));
-    return std::min(deposits, p.photon_capacity);
+
+    if (timings) {
+        timings->photon_trace = traceMs;
+        timings->build = buildMs;
+        timings->radius = p.gather_radius;
+        timings->cells = stats.cells;
+        timings->buckets = stats.buckets;
+        timings->photons = stored;
+    }
+    return stored;
 }
 
 // void launchPhotonTracing(RendererState& state, Params& p, CUstream& stream) {
@@ -1420,17 +1626,47 @@ int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream)
 //     CUDA_CHECK(cudaStreamSynchronize(stream));
 // }
 
-void launchPhotonGathering(RendererState& state, Params& p, CUstream& stream) {
-    OptixShaderBindingTable sbtGather = state.sbt;
-    sbtGather.raygenRecord = state.drg_gather;
+// One raygen launch over the whole image, with `record` as the entry point.
+static float launchPixelPass(RendererState& state, Params& p, CUstream& stream,
+    CUdeviceptr record, GpuTimer& timer)
+{
+    OptixShaderBindingTable sbtPass = state.sbt;
+    sbtPass.raygenRecord = record;
 
     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
                               &p, sizeof(Params),
                               cudaMemcpyHostToDevice, stream));
+    timer.start(stream);
     OPTIX_CHECK(optixLaunch(state.pipeline, stream,
                             state.dParams, sizeof(Params),
-                            &sbtGather, p.width, p.height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+                            &sbtPass, p.width, p.height, 1));
+    const float ms = timer.stopMs(stream);
+    return ms;
+}
+
+// Gather pass 1: camera walk -> one GatherPoint per pixel.
+float launchCameraPass(RendererState& state, Params& p, CUstream& stream)
+{
+    static GpuTimer timer;
+    // Photon mapping is one camera sample per frame; see Params::samples_per_pixel.
+    p.samples_per_pixel = 1;
+    return launchPixelPass(state, p, stream, state.drg_camera, timer);
+}
+
+// Gather pass 2: the photon lookup -> one radiance per pixel.
+float launchQueryPass(RendererState& state, Params& p, CUstream& stream)
+{
+    static GpuTimer timer;
+    return launchPixelPass(state, p, stream, state.drg_query, timer);
+}
+
+// Fold the query result into the accumulation buffer and tone-map it.
+float launchAccumulatePass(Params& p, CUstream& stream)
+{
+    static GpuTimer timer;
+    timer.start(stream);
+    launchAccumulate(p, stream);
+    return timer.stopMs(stream);
 }
 
 // Splats the photon map onto the film and tone-maps the result.
@@ -1507,7 +1743,173 @@ void launchLightVis(RendererState& state, Params& p, CUstream stream,
                            cudaMemcpyHostToDevice));
 }
 
-static bool renderOffline(RendererState& state, Params& p, const std::string& outputFile)
+// Per-frame timings, averaged over everything past the warm-up.
+//
+// The first frames are dropped because they are not the steady state being
+// compared: frame 0 pays for every first-touch allocation in the build, the
+// driver's first launch of each program, and the clocks still ramping up.  It
+// is also why exec.py's whole-process time is the wrong number to quote — that
+// one includes glTF parsing, the acceleration build and the PTX compile.
+static void reportTimings(const std::vector<FrameTimings>& timings,
+    const RunArgs& args, const Params& p)
+{
+    const int n = (int)timings.size();
+    const int skip = std::min(args.warmupFrames, std::max(0, n - 1));
+    if (n - skip <= 0)
+        return;
+
+    FrameTimings sum;
+    long long cells = 0;
+    long long buckets = 0;
+    long long photons = 0;
+    for (int i = skip; i < n; ++i) {
+        sum.photon_trace += timings[i].photon_trace;
+        sum.build += timings[i].build;
+        sum.camera += timings[i].camera;
+        sum.query += timings[i].query;
+        sum.accum += timings[i].accum;
+        cells += timings[i].cells;
+        buckets += timings[i].buckets;
+        photons += timings[i].photons;
+    }
+    const float inv = 1.f / float(n - skip);
+    const double invd = 1.0 / double(n - skip);
+
+    std::cout << "[Timing] " << (n - skip) << " frames"
+              << " (" << skip << " warm-up skipped)"
+              << ", " << p.width << "x" << p.height
+              << ", structure = " << accelLabel(gAccel)
+              << "\n         mean ms/frame:"
+              << "\n           photon trace  " << sum.photon_trace * inv
+              << "\n           build         " << sum.build * inv
+              << "\n           camera pass   " << sum.camera * inv
+              << "\n           query pass    " << sum.query * inv
+              << "\n           accumulate    " << sum.accum * inv
+              << "\n           ------------------------"
+              << "\n           total         " << sum.total() * inv
+              << "\n         mean photons/frame " << double(photons) * invd;
+    if (gAccel == ACCEL_UNIFORM_GRID)
+        std::cout << ", mean cells " << double(cells) * invd;
+    else if (gAccel == ACCEL_HASH_GRID)
+        std::cout << ", mean buckets " << double(buckets) * invd;
+    std::cout << "\n";
+    if (args.verifyGather)
+        std::cout << "         (query pass not timed: --verify-gather runs it twice)\n";
+}
+
+// The same numbers as JSON, one record per frame, for whatever plots the
+// comparison ends up needing.  Written by hand rather than through a library
+// because it is a dozen fields and the file is an output, not an interface.
+static void writeTimingJson(const std::string& path,
+    const std::vector<FrameTimings>& timings, const RunArgs& args, const Params& p)
+{
+    if (path.empty() || timings.empty())
+        return;
+
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "[Timing] could not write " << path << "\n";
+        return;
+    }
+    out.precision(6);
+    out << std::fixed;
+    out << "{\n";
+    out << "  \"accel\": \"" << accelName(gAccel) << "\",\n";
+    out << "  \"width\": " << p.width << ",\n";
+    out << "  \"height\": " << p.height << ",\n";
+    out << "  \"frames\": " << p.offline_frames << ",\n";
+    out << "  \"warmup\": " << args.warmupFrames << ",\n";
+    out << "  \"max_depth\": " << p.max_depth << ",\n";
+    out << "  \"photon_paths\": " << p.num_photon_paths << ",\n";
+    out << "  \"seed\": " << p.seed << ",\n";
+    out << "  \"per_frame\": [\n";
+    for (size_t i = 0; i < timings.size(); ++i) {
+        const FrameTimings& t = timings[i];
+        out << "    {\"frame\": " << i
+            << ", \"radius\": " << t.radius
+            << ", \"photons\": " << t.photons
+            << ", \"cells\": " << t.cells
+            << ", \"buckets\": " << t.buckets
+            << ", \"photon_trace_ms\": " << t.photon_trace
+            << ", \"build_ms\": " << t.build
+            << ", \"camera_ms\": " << t.camera
+            << ", \"query_ms\": " << t.query
+            << ", \"accum_ms\": " << t.accum << "}"
+            << (i + 1 < timings.size() ? ",\n" : "\n");
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+// How far the structure's answer is from the brute-force one.
+struct GatherVerification {
+    double max_abs = 0.0; // largest absolute difference in any channel
+    double max_rel = 0.0; // largest relative difference where there is signal
+    int differing_pixels = 0; // pixels past the tolerance below
+    bool ok = true;
+};
+
+// Runs the query pass twice over the same photon map and the same gather
+// points — once through the selected structure (uniform grid or hash grid),
+// once over every photon — and compares the two images.  This is the correctness check the acceleration structures are held
+// to: the structure is only allowed to change which photons get *looked at*,
+// never which ones are inside the radius.
+//
+// The two are not expected to be bit-identical.  They add the same photons in a
+// different order, and float addition is not associative, so a few ulps of
+// drift per pixel is the floor.  A structure that misses photons fails by
+// orders of magnitude more than that, which is what the tolerance is set for.
+//
+// Leaves query_radiance holding the structure's result, so the caller
+// accumulates the image it would have rendered anyway.
+static GatherVerification verifyQueryPass(RendererState& state, Params& p,
+    CUstream& stream, std::vector<float3>& brute, std::vector<float3>& grid)
+{
+    const size_t pixels = size_t(p.width) * size_t(p.height);
+    brute.resize(pixels);
+    grid.resize(pixels);
+
+    const int builtAccel = p.accel;
+
+    p.accel = ACCEL_BRUTE_FORCE;
+    launchQueryPass(state, p, stream);
+    CUDA_CHECK(cudaMemcpy(brute.data(), p.query_radiance,
+        pixels * sizeof(float3), cudaMemcpyDeviceToHost));
+
+    p.accel = builtAccel;
+    launchQueryPass(state, p, stream);
+    CUDA_CHECK(cudaMemcpy(grid.data(), p.query_radiance,
+        pixels * sizeof(float3), cudaMemcpyDeviceToHost));
+
+    GatherVerification v;
+    for (size_t i = 0; i < pixels; ++i) {
+        const float a[3] = { brute[i].x, brute[i].y, brute[i].z };
+        const float b[3] = { grid[i].x, grid[i].y, grid[i].z };
+        bool bad = false;
+        for (int c = 0; c < 3; ++c) {
+            const double diff = std::fabs((double)a[c] - (double)b[c]);
+            const double scale = std::max(std::fabs((double)a[c]), std::fabs((double)b[c]));
+            v.max_abs = std::max(v.max_abs, diff);
+            // Relative error is meaningless on a pixel that is essentially
+            // black; the absolute figure covers those.
+            if (scale > 1e-4) {
+                const double rel = diff / scale;
+                v.max_rel = std::max(v.max_rel, rel);
+                if (rel > 1e-3)
+                    bad = true;
+            } else if (diff > 1e-5) {
+                bad = true;
+            }
+        }
+        if (bad)
+            ++v.differing_pixels;
+    }
+    v.ok = (v.differing_pixels == 0);
+    return v;
+}
+
+static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
+    const std::string& outputFile)
 {
     const int W = static_cast<int>(p.width);
     const int H = static_cast<int>(p.height);
@@ -1525,6 +1927,15 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     CUdeviceptr dLightvisBuf = 0;
     if (p.render_mode == 2)
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dLightvisBuf), W * H * sizeof(float3)));
+
+    if (p.render_mode == 1) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dGatherPoints),
+            size_t(W) * H * sizeof(GatherPoint)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dQueryRadiance),
+            size_t(W) * H * sizeof(float3)));
+        p.gather_points = reinterpret_cast<GatherPoint*>(state.dGatherPoints);
+        p.query_radiance = reinterpret_cast<float3*>(state.dQueryRadiance);
+    }
 
     p.frame_buffer = dFrame;
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
@@ -1550,6 +1961,18 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
                   << "\n      reff = " << rEff << "  <- the blur the averaged image actually has\n";
     }
 
+    std::vector<FrameTimings> timings;
+    timings.reserve(p.offline_frames);
+
+    // --verify-gather replaces the timed query pass with two untimed ones, so a
+    // run either measures or checks — never both.
+    const bool verifyGather = args.verifyGather && p.render_mode == 1
+        && gAccel != ACCEL_BRUTE_FORCE;
+    if (args.verifyGather && gAccel == ACCEL_BRUTE_FORCE)
+        std::cerr << "[Verify] --accel brute builds no structure; nothing to compare against\n";
+    std::vector<float3> verifyBrute, verifyGrid;
+    int verifyFailures = 0;
+
     for (int f = 0; f < p.offline_frames; ++f) {
 
         if (p.render_mode == 0) {
@@ -1557,18 +1980,38 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
             launchPathTracing(state, p, stream);
         } else if (p.render_mode == 1) {
             // Probabilistic PPM: shrink the radius for this frame *before* the
-            // map is traced, because buildPhotonGrid bins at gather_radius.
+            // map is traced, because the grid is binned at gather_radius.
             updatePPMRadius(p);
 
-            // Pass 1 — Photon tracing.  A fresh map every frame: reusing one
-            // map would make every frame share the same density-estimate
-            // error, so the blotches would stay put no matter how long it ran.
-            // It is also what makes the frames independent estimates, which is
-            // the assumption the PPM radius schedule is derived under.
-            launchPhotonTracing(state, p, stream);
+            FrameTimings ft;
 
-            // Pass 2 — Gathering
-            launchPhotonGathering(state, p, stream);
+            // Pass 1 — Photon tracing, then the grid build.  A fresh map every
+            // frame: reusing one map would make every frame share the same
+            // density-estimate error, so the blotches would stay put no matter
+            // how long it ran.  It is also what makes the frames independent
+            // estimates, which is the assumption the PPM radius schedule is
+            // derived under.
+            launchPhotonTracing(state, p, stream, &ft);
+
+            // Pass 2 — the camera walk, and then the photon lookup it parked.
+            ft.camera = launchCameraPass(state, p, stream);
+
+            if (verifyGather) {
+                const GatherVerification v = verifyQueryPass(state, p, stream,
+                    verifyBrute, verifyGrid);
+                if (!v.ok)
+                    ++verifyFailures;
+                std::cout << "\r[Verify] frame " << f
+                          << (v.ok ? "  OK  " : "  FAIL")
+                          << "  " << accelName(gAccel) << " vs brute: max abs diff = " << v.max_abs
+                          << "  max rel = " << v.max_rel
+                          << "  pixels off = " << v.differing_pixels << "\n";
+            } else {
+                ft.query = launchQueryPass(state, p, stream);
+            }
+
+            ft.accum = launchAccumulatePass(p, stream);
+            timings.push_back(ft);
         } else if (p.render_mode == 2) {
             launchPhotonTracing(state, p, stream);
             launchLightVis(state, p, stream, dLightvisBuf);
@@ -1580,6 +2023,14 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     }
 
     std::cout << "\n";
+
+    reportTimings(timings, args, p);
+    writeTimingJson(args.timingJson, timings, args, p);
+    if (verifyGather) {
+        std::cout << "[Verify] " << (verifyFailures == 0 ? "PASS" : "FAIL")
+                  << " — " << (p.offline_frames - verifyFailures) << "/"
+                  << p.offline_frames << " frames matched brute force\n";
+    }
 
     std::vector<float3> hostAccum(W * H);
     const float invF = 1.0f / float(p.offline_frames);
@@ -1617,8 +2068,16 @@ static bool renderOffline(RendererState& state, Params& p, const std::string& ou
     CUDA_CHECK(cudaFree(dAccum));
     if (dLightvisBuf)
         CUDA_CHECK(cudaFree(reinterpret_cast<void*>(dLightvisBuf)));
+    if (state.dGatherPoints) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.dGatherPoints)));
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.dQueryRadiance)));
+        state.dGatherPoints = state.dQueryRadiance = 0;
+    }
+    freeGridScratch(state.grid);
 
-    return ok;
+    // A failed comparison is a failed run: the image is there, but it was not
+    // produced by a lookup anyone should trust.
+    return ok && verifyFailures == 0;
 }
 
 bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p) {
@@ -1665,6 +2124,15 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dLightvisBuf),
                         W * H * sizeof(float3)));
 
+    // The split gather needs these in every mode here, because the render mode
+    // is a dropdown away at any moment.
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dGatherPoints),
+        size_t(W) * H * sizeof(GatherPoint)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dQueryRadiance),
+        size_t(W) * H * sizeof(float3)));
+    p.gather_points = reinterpret_cast<GatherPoint*>(state.dGatherPoints);
+    p.query_radiance = reinterpret_cast<float3*>(state.dQueryRadiance);
+
     p.frame_index = 0;
 
     CUstream stream;
@@ -1696,12 +2164,21 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         int renderMode = p.render_mode;
         if (ImGui::Combo("Render mode", &renderMode, renderModes, IM_ARRAYSIZE(renderModes))) {
             p.render_mode = renderMode;
+            if (p.render_mode == 1)
+                p.samples_per_pixel = 1;
             resetAccum = true;
         }
 
         if (ImGui::CollapsingHeader("Sampling")) {
-            if (ImGui::SliderInt("Samples / pixel", &p.samples_per_pixel, 1, 16))
+            // Photon mapping pins this to 1 — see Params::samples_per_pixel.
+            // Saying so beats a slider that silently does nothing.
+            if (p.render_mode == 1) {
+                ImGui::Text("Samples / pixel: 1");
+                ImGui::SameLine();
+                ImGui::TextDisabled("(fixed: frames, not samples, are what converge a photon map)");
+            } else if (ImGui::SliderInt("Samples / pixel", &p.samples_per_pixel, 1, 16)) {
                 resetAccum = true;
+            }
             if (ImGui::SliderInt("Max depth", &p.max_depth, 1, 16)) {
                 resetAccum = true;
                 resetPhotons = true;
@@ -1807,6 +2284,18 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             ImGui::Checkbox("Retrace every frame", &retracePhotons);
             ImGui::SameLine();
             ImGui::TextDisabled("(off = noise stops converging)");
+
+            // Switching the structure must not change the image: the same
+            // photons pass the same tests, only the set of photons *looked at*
+            // differs.  Brute force is the reference that tests every photon.
+            const char* accelItems[] = { "Brute force", "Uniform grid", "Hash grid" };
+            int accelIndex = (int)gAccel;
+            if (ImGui::Combo("Acceleration structure", &accelIndex, accelItems,
+                    IM_ARRAYSIZE(accelItems))) {
+                gAccel = (AccelType)accelIndex;
+                resetAccum = true;
+                resetPhotons = true; // the structure is built by the photon pass
+            }
         }
 
         if (p.render_mode == 2 && ImGui::CollapsingHeader("Photon visualisation", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1938,10 +2427,13 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             }
 
             // Pass 2 — Gathering, or splatting the map straight onto the film
-            if (p.render_mode == 1)
-                launchPhotonGathering(state, p, stream);
-            else
+            if (p.render_mode == 1) {
+                launchCameraPass(state, p, stream);
+                launchQueryPass(state, p, stream);
+                launchAccumulatePass(p, stream);
+            } else {
                 launchLightVis(state, p, stream, dLightvisBuf);
+            }
         }
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaPBO, stream));
@@ -1966,6 +2458,11 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     ImGui::DestroyContext();
     cudaStreamDestroy(stream);
     cudaFree(reinterpret_cast<void*>(dAccum));
+    cudaFree(reinterpret_cast<void*>(dLightvisBuf));
+    cudaFree(reinterpret_cast<void*>(state.dGatherPoints));
+    cudaFree(reinterpret_cast<void*>(state.dQueryRadiance));
+    state.dGatherPoints = state.dQueryRadiance = 0;
+    freeGridScratch(state.grid);
     cudaGraphicsUnregisterResource(cudaPBO);
 
     glDeleteBuffers(1, &pbo);
@@ -1981,6 +2478,13 @@ int main(int argc, char** argv) {
     // program arguments
     RunArgs args{};
     args = parseArgs(argc, argv);
+    // Checked before anything is loaded, so a typo fails in milliseconds
+    // rather than after the scene and the pipeline have been built.
+    if (!parseAccel(args.accel, gAccel)) {
+        std::cerr << "Unknown --accel value: " << args.accel
+                  << " (expected grid, hash or brute)\n";
+        return 2;
+    }
     CameraFileState cam{};
     cam = loadCameraFile(args.cameraFile);
 
@@ -1988,7 +2492,13 @@ int main(int argc, char** argv) {
     Scene scene;
     Params p = {};
 
+    // --res only applies offline: the realtime path renders into a fixed-size
+    // GL window, so a mismatch there would just corrupt the display.
     int W = 1280, H = 720;
+    if (args.offline && args.width > 0 && args.height > 0) {
+        W = args.width;
+        H = args.height;
+    }
 
     p.width = W;
     p.height = H;
@@ -2070,6 +2580,13 @@ int main(int argc, char** argv) {
         p.render_mode = 2; // photon tracing only (visualise the map)
     }
 
+    // One camera sample per frame in photon mapping — see the note on
+    // Params::samples_per_pixel.  The camera pass ignores the field anyway;
+    // setting it here keeps what gets printed and saved honest.
+    if (p.render_mode == 1)
+        p.samples_per_pixel = 1;
+
+
     if (args.frames > 0)
         p.offline_frames = args.frames;
 
@@ -2129,7 +2646,7 @@ int main(int argc, char** argv) {
 
 
     if(args.offline) {
-        if (!renderOffline(state, p, args.outputFile)) {
+        if (!renderOffline(state, p, args, args.outputFile)) {
             std::cerr << "Offline rendering failed.\n";
             return 1;
         }
@@ -2147,7 +2664,9 @@ int main(int argc, char** argv) {
     if (state.dLights)
         cudaFree(reinterpret_cast<void*>(state.dLights));
     cudaFree(reinterpret_cast<void*>(state.drg_photon));
-    cudaFree(reinterpret_cast<void*>(state.drg_gather));
+    cudaFree(reinterpret_cast<void*>(state.drg_camera));
+    cudaFree(reinterpret_cast<void*>(state.drg_query));
+    cudaFree(reinterpret_cast<void*>(state.drg_lightvis));
     for (auto tex : state.texObjects)
         cudaDestroyTextureObject(tex);
     for (auto arr : state.texArrays)

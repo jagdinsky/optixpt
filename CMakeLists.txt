@@ -38,7 +38,14 @@ target_link_libraries(imgui PUBLIC
     OpenGL::GL
 )
 
-add_executable(renderer src/main.cpp)
+# main.cpp is host C++; cuda_passes.cu is compiled by nvcc into the same binary
+# (it is where the grid build's CUB kernels live).  device.cu above is a
+# different thing entirely — PTX for OptiX, never linked into the executable.
+add_executable(renderer src/main.cpp src/cuda_passes.cu)
+
+# "native" builds for the GPU in this machine.  Only the executable gets it:
+# device_ptx has to stay a single-architecture PTX blob.
+set_target_properties(renderer PROPERTIES CUDA_ARCHITECTURES native)
 
 target_include_directories(renderer PRIVATE
     ${OptiX_INCLUDE}

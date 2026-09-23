@@ -71,6 +71,8 @@ def parse_args():
                    metavar=("SMALL", "BIG"), help="photon-mapping max path lengths")
     p.add_argument("--paths", type=int, default=1_000_000,
                    help="photon paths per frame")
+    p.add_argument("--accel", choices=("grid", "hash", "brute"), default="grid",
+                   help="acceleration structure the photon gather searches with")
 
     p.add_argument("--sky", type=float, default=None,
                    help="sky intensity; omitted keeps the renderer default (off)")
@@ -123,6 +125,11 @@ def build():
         fail("build failed")
 
 
+def timing_path(output):
+    """Where the renderer drops its per-pass timings for this image."""
+    return os.path.splitext(output)[0] + ".timing.json"
+
+
 def render_cmd(args, *, photon, frames, depth, output, paths=None):
     cmd = [RENDERER, args.scene, "--offline",
            "--camera", args.camera,
@@ -133,6 +140,12 @@ def render_cmd(args, *, photon, frames, depth, output, paths=None):
     if photon:
         cmd.append("--photon")
         cmd += ["--paths", str(paths if paths is not None else args.paths)]
+        cmd += ["--accel", args.accel]
+        # The process time below covers glTF parsing, the acceleration build and
+        # the PTX compile as well as the render.  For anything comparing photon
+        # lookups that is the wrong number, so the renderer reports its own
+        # per-pass, per-frame timings and they get stored next to the image.
+        cmd += ["--timing-json", timing_path(output)]
     if args.sky is not None:
         cmd += ["--sky", str(args.sky)]
     if args.sky_photons is not None:
@@ -162,6 +175,38 @@ def run_render(cmd, output, dry_run):
         fail("render reported success but wrote no image: %s" % output)
     print("  -> %s  (%s)" % (short_path(output), hms(seconds)))
     return seconds
+
+
+def read_timings(path):
+    """The renderer's per-pass timings, summarised for the manifest.
+
+    Means are taken over the frames past the warm-up, which is the same set the
+    renderer prints — a render whose frames are all warm-up reports nothing.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (IOError, ValueError):
+        return None
+
+    frames = data.get("per_frame", [])
+    timed = frames[data.get("warmup", 0):]
+    if not timed:
+        return None
+
+    passes = ("photon_trace_ms", "build_ms", "camera_ms", "query_ms", "accum_ms")
+    mean = {k: sum(fr.get(k, 0.0) for fr in timed) / len(timed) for k in passes}
+    mean["total_ms"] = sum(mean.values())
+    return {
+        "accel": data.get("accel"),
+        "timed_frames": len(timed),
+        "mean_ms": mean,
+        "first_radius": timed[0].get("radius"),
+        "last_radius": timed[-1].get("radius"),
+        "mean_photons": sum(fr.get("photons", 0) for fr in timed) / len(timed),
+        "mean_cells": sum(fr.get("cells", 0) for fr in timed) / len(timed),
+        "mean_buckets": sum(fr.get("buckets", 0) for fr in timed) / len(timed),
+    }
 
 
 def short_path(path):
@@ -239,6 +284,7 @@ def main():
         "camera": args.camera,
         "seed": args.seed,
         "paths": args.paths,
+        "accel": args.accel,
         "budget": args.budget,
         "sky": args.sky,
         "sky_photons": args.sky_photons,
@@ -290,11 +336,13 @@ def main():
 
     unit_costs = []
     for i, (frames, depth) in enumerate(grid):
-        name = "pm_f%d_d%d_p%d_s%d.exr" % (frames, depth, args.paths, args.seed)
+        suffix = "" if args.accel == "grid" else "_" + args.accel
+        name = "pm_f%d_d%d_p%d_s%d%s.exr" % (frames, depth, args.paths, args.seed, suffix)
         output = os.path.join(args.out, name)
         cmd = render_cmd(args, photon=True, frames=frames, depth=depth, output=output)
         entry = {"file": name, "mode": "photon mapping", "frames": frames,
                  "depth": depth, "paths": args.paths, "seed": args.seed,
+                 "accel": args.accel,
                  "command": shell(cmd)}
         if os.path.exists(output) and not args.force:
             print("\nalready rendered: %s (--force to redo)" % name)
@@ -310,6 +358,7 @@ def main():
                 print("\n[%d/%d] frames %d, depth %d" % (i + 1, len(grid), frames, depth))
             seconds = run_render(cmd, output, args.dry_run)
             entry["seconds"] = seconds
+            entry["timing"] = read_timings(timing_path(output))
             if seconds > 0:
                 unit_costs.append(seconds / float(frames * depth))
         manifest["photon"].append(entry)
@@ -328,8 +377,15 @@ def main():
     print("\ndone in %s — images in %s"
           % (hms(manifest["total_seconds"]), short_path(args.out)))
     for entry in ([manifest["reference"]] if manifest["reference"] else []) + manifest["photon"]:
-        print("  %-40s %s" % (entry["file"],
-                              "reused" if entry.get("skipped") else hms(entry["seconds"])))
+        note = ""
+        timing = entry.get("timing")
+        if timing:
+            m = timing["mean_ms"]
+            note = "   per frame: %.1fms trace, %.1fms build, %.1fms query" % (
+                m["photon_trace_ms"], m["build_ms"], m["query_ms"])
+        print("  %-40s %s%s" % (entry["file"],
+                                "reused" if entry.get("skipped") else hms(entry["seconds"]),
+                                note))
     print("  %-40s render settings and timings" % "manifest.json")
 
 
