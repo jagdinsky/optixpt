@@ -26,8 +26,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -131,6 +133,14 @@ static void rebuildCameraVectors(Params& p)
     p.cam_w = fwd;
     p.cam_u = make_float3(right.x * h * aspect, right.y * h * aspect, right.z * h * aspect);
     p.cam_v = make_float3(up.x * h, up.y * h, up.z * h);
+
+    // The angle one pixel spans: the image plane's height 2|cam_v| over its
+    // distance |cam_w|, split into `height` rows — the convention
+    // __raygen__lightvis projects with.  A pixel at distance t then covers a
+    // patch of surface about t * pixel_angle wide.
+    const float vLen = sqrtf(p.cam_v.x * p.cam_v.x + p.cam_v.y * p.cam_v.y + p.cam_v.z * p.cam_v.z);
+    const float wLen = sqrtf(p.cam_w.x * p.cam_w.x + p.cam_w.y * p.cam_w.y + p.cam_w.z * p.cam_w.z);
+    p.pixel_angle = 2.f * vLen / (wLen * float(p.height));
 }
 
 // Handles keyboard input to move the camera
@@ -207,9 +217,27 @@ struct RendererState {
     OptixProgramGroup hitGroup = nullptr;
     OptixProgramGroup photonRaygenGroup = nullptr;
     OptixProgramGroup cameraRaygenGroup = nullptr; // gather pass 1
-    OptixProgramGroup queryRaygenGroup = nullptr; // gather pass 2
+    // (gather pass 2, the photon lookup, is a CUDA kernel: launchQueryKernel)
 
+    // The "trace" pipeline: every program that traces rays — the path
+    // tracer, the camera and photon passes, the photon visualisation — and
+    // their miss and hit programs.  OptiX gives every program of a pipeline
+    // the same register count, which is why the lookups are not in it.
     OptixPipeline pipeline = nullptr;
+    // Splatting's photon pass, with the same miss and hit programs: a pipeline
+    // of its own, so that its code costs the storing photon pass no registers.
+    OptixProgramGroup splatRaygenGroup = nullptr;
+    OptixPipeline splatPipeline = nullptr;
+    CUdeviceptr drg_splat = 0;
+    // ... and stochastic splatting's, in a pipeline of its own as well.
+    OptixProgramGroup stochsplatRaygenGroup = nullptr;
+    OptixPipeline stochsplatPipeline = nullptr;
+    CUdeviceptr drg_stochsplat = 0;
+    // --fused: the camera walk and the lookup in one program, one per
+    // structure (fusedIndex), each in a pipeline of its own.
+    OptixProgramGroup fusedRaygenGroups[5] = {};
+    OptixPipeline fusedPipelines[5] = {};
+    CUdeviceptr drg_fused[5] = {};
     OptixShaderBindingTable sbt = {};
     OptixTraversableHandle gasHandle = 0;
 
@@ -222,7 +250,6 @@ struct RendererState {
 
     CUdeviceptr drg_photon = 0;
     CUdeviceptr drg_camera = 0;
-    CUdeviceptr drg_query = 0;
 
     // Working memory for the photon-grid build (device side, see cuda_passes.h)
     GridScratch grid;
@@ -245,7 +272,16 @@ struct RendererState {
 
     // Light visualization launch group and device pointer for photon tracing only mode
     OptixProgramGroup lightvisRaygenGroup = nullptr;
-    CUdeviceptr drg_lightvis = 0;                     
+    CUdeviceptr drg_lightvis = 0;
+
+    // The levels in use and photon culling (see Params::culling).  Allocated
+    // the first time a frame needs them — culling can be switched on from the
+    // GUI — and kept after that.
+    int* dUsedLevels = nullptr; // [MAX_LEVELS]
+    int* dDepositCounts = nullptr; // [2]
+    unsigned int* dCullMask = nullptr;
+    unsigned int* dCullParent = nullptr; // --hier-mask
+    size_t cullMaskBytes = 0;
 };
 
 struct Scene {
@@ -335,6 +371,11 @@ struct RunArgs {
     float finalRadius = -1.f;
     std::string cameraFile = "camera.txt";
     std::string outputFile = "../build/output.exr";
+    // 32-bit float channels instead of half.  Half keeps 11 significant bits,
+    // so two renders that differ only by float-summation order can land on
+    // either side of a half rounding step and look 1e-3 apart; comparing images
+    // at 1e-5 needs the full float.
+    bool floatExr = false;
 
     // Offline resolution.  0 = keep the default; small frames are what make a
     // brute-force comparison run affordable.
@@ -342,11 +383,90 @@ struct RunArgs {
     int height = 0;
 
     // Gather-side switches, all aimed at the acceleration-structure comparison.
-    std::string accel = "grid"; // grid | hash | brute — structure the gather searches
+    std::string accel = "grid"; // grid | hash | stochastic | rectified | brute
     bool verifyGather = false; // run every query pass twice, structure vs brute force
     int warmupFrames = 1; // frames left out of the timing summary
     std::string timingJson; // where to write the per-frame pass timings
+
+    // Photon culling: store only photons some lookup of the frame can reach.
+    bool culling = false;
+    int maskBits = 24; // culling mask of 2^maskBits bits (24 = 2 MiB)
+    bool verifyCulling = false; // trace every frame culled and not, compare
+    float s0 = -1.f; // level-0 cell side in world units; <0 = sceneDiag * 2^-18
+
+    // Per-pixel radius: r = s * k_pix * (the surface one pixel covers).
+    std::string radiusMode = "global"; // global | footprint
+    float kPix = 4.f;
+    std::string debugExr; // prefix for the per-pixel debug images of the last frame
+    int firstFrame = 0; // frame index of the first frame rendered (offline)
+    long long rectBuckets = 0; // multi-level rectified table size; 0 = automatic
+    bool selftestReservoir = false; // run the reservoir unit test and exit
+    bool stats = false; // per-lookup counters, summarised every frame
+    bool mlrectInTrace = false; // fill mlrect in the photon pass, not a kernel
+    float tableLoad = 4.f; // buckets per entry of every hash table
+    // OptiX validation: extra checks, and a synchronisation after every
+    // launch, so off unless asked for — it inflates every pass time.
+    bool validation = false;
+
+    // Error against time.  At every checkpoint (a number of frames, counted
+    // from 1 within the run) the accumulated image is saved and the GPU time
+    // spent so far is recorded; --checkpoints without a list means every
+    // power of two up to --frames.  --dump-frames saves the radiance of single
+    // frames, not accumulated.
+    std::vector<int> checkpoints;
+    bool checkpointsPow2 = false;
+    std::vector<int> dumpFrames;
+
+    // Splatting: visible points are filed on cells at least F x r wide, and
+    // the flux is gathered in K copies of the accumulators.
+    float splatCellFactor = 2.f;
+    int splatStripes = 1;
+
+    // Optional: positions next to the entries of the hash grids and the
+    // splatting grid, tested before a photon or gather point is loaded.
+    bool inlinePositions = false;
+    // Optional: a mask of parent cells, so that the photon pass rejects most
+    // photons at the coarsest level in use (culling only).
+    bool hierMask = false;
+    // Optional, family A: the camera walk and the lookup in one program, the
+    // structure built first from the previous frame's radii and levels.
+    bool fused = false;
 };
+
+// "4,8,16", "1-64" or "1-1024:16" (every 16th frame from 1), and any
+// comma-separated mix of these; false if `s` is not such a list.
+static bool parseFrameList(const std::string& s, std::vector<int>& out)
+{
+    std::vector<int> frames;
+    std::stringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        int a = 0, b = 0, step = 1;
+        char dash = 0, colon = 0;
+        std::istringstream t(tok);
+        if (!(t >> a) || a < 1)
+            return false;
+        b = a;
+        if (t >> dash) {
+            if (dash != '-' || !(t >> b) || b < a)
+                return false;
+            if (t >> colon) {
+                if (colon != ':' || !(t >> step) || step < 1)
+                    return false;
+            }
+        }
+        if (t >> dash) // anything left over
+            return false;
+        for (int f = a; f <= b; f += step)
+            frames.push_back(f);
+    }
+    if (frames.empty())
+        return false;
+    std::sort(frames.begin(), frames.end());
+    frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+    out = frames;
+    return true;
+}
 
 static RunArgs parseArgs(int argc, char** argv) {
     RunArgs args;
@@ -386,6 +506,8 @@ static RunArgs parseArgs(int argc, char** argv) {
             args.cameraFile = argv[++i];
         } else if (a == "--output" && i + 1 < argc) {
             args.outputFile = argv[++i];
+        } else if (a == "--float-exr") {
+            args.floatExr = true;
         } else if (a == "--res" && i + 2 < argc) {
             args.width = std::max(1, atoi(argv[++i]));
             args.height = std::max(1, atoi(argv[++i]));
@@ -399,6 +521,94 @@ static RunArgs parseArgs(int argc, char** argv) {
             args.warmupFrames = std::max(0, atoi(argv[++i]));
         } else if (a == "--timing-json" && i + 1 < argc) {
             args.timingJson = argv[++i];
+        } else if (a == "--culling" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "on" && v != "off") {
+                std::cerr << "--culling expects on or off, not " << v << "\n";
+                std::exit(2);
+            }
+            args.culling = (v == "on");
+        } else if (a == "--mask-bits" && i + 1 < argc) {
+            args.maskBits = std::max(10, std::min(31, atoi(argv[++i])));
+        } else if (a == "--verify-culling") {
+            args.verifyCulling = true;
+        } else if (a == "--s0" && i + 1 < argc) {
+            args.s0 = (float)atof(argv[++i]);
+        } else if (a == "--radius-mode" && i + 1 < argc) {
+            args.radiusMode = argv[++i];
+            if (args.radiusMode != "global" && args.radiusMode != "footprint") {
+                std::cerr << "--radius-mode expects global or footprint, not "
+                          << args.radiusMode << "\n";
+                std::exit(2);
+            }
+        } else if (a == "--k-pix" && i + 1 < argc) {
+            args.kPix = std::max(1e-3f, (float)atof(argv[++i]));
+        } else if (a == "--debug-exr" && i + 1 < argc) {
+            args.debugExr = argv[++i];
+        } else if (a == "--first-frame" && i + 1 < argc) {
+            args.firstFrame = std::max(0, atoi(argv[++i]));
+        } else if (a == "--rect-buckets" && i + 1 < argc) {
+            args.rectBuckets = atoll(argv[++i]);
+            if (args.rectBuckets < 1024 || args.rectBuckets > (1LL << 28)
+                || (args.rectBuckets & (args.rectBuckets - 1)) != 0) {
+                std::cerr << "--rect-buckets expects a power of two in [2^10, 2^28]\n";
+                std::exit(2);
+            }
+        } else if (a == "--selftest-reservoir") {
+            args.selftestReservoir = true;
+        } else if (a == "--stats") {
+            args.stats = true;
+        } else if (a == "--mlrect-in-trace") {
+            args.mlrectInTrace = true;
+        } else if (a == "--table-load" && i + 1 < argc) {
+            args.tableLoad = (float)atof(argv[++i]);
+            if (!(args.tableLoad >= 0.25f && args.tableLoad <= 64.f)) {
+                std::cerr << "--table-load expects buckets per entry in [0.25, 64]\n";
+                std::exit(2);
+            }
+        } else if (a == "--validation" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "on" && v != "off") {
+                std::cerr << "--validation expects on or off, not " << v << "\n";
+                std::exit(2);
+            }
+            args.validation = (v == "on");
+        } else if (a == "--checkpoints") {
+            // The list is optional; the next argument is taken as one only if
+            // it reads as one, so a scene file after the flag stays a scene.
+            std::vector<int> list;
+            if (i + 1 < argc && parseFrameList(argv[i + 1], list)) {
+                args.checkpoints = list;
+                ++i;
+            } else if (i + 1 < argc && std::string(argv[i + 1]) == "pow2") {
+                args.checkpointsPow2 = true;
+                ++i;
+            } else {
+                args.checkpointsPow2 = true;
+            }
+        } else if (a == "--dump-frames" && i + 1 < argc) {
+            if (!parseFrameList(argv[++i], args.dumpFrames)) {
+                std::cerr << "--dump-frames expects a list of frames like 1,2,8 or 1-64:4\n";
+                std::exit(2);
+            }
+        } else if (a == "--splat-cell-factor" && i + 1 < argc) {
+            args.splatCellFactor = (float)atof(argv[++i]);
+            if (args.splatCellFactor != 1.f && args.splatCellFactor != 2.f) {
+                std::cerr << "--splat-cell-factor expects 1 or 2\n";
+                std::exit(2);
+            }
+        } else if (a == "--inline-positions") {
+            args.inlinePositions = true;
+        } else if (a == "--hier-mask") {
+            args.hierMask = true;
+        } else if (a == "--fused") {
+            args.fused = true;
+        } else if (a == "--splat-stripes" && i + 1 < argc) {
+            args.splatStripes = atoi(argv[++i]);
+            if (args.splatStripes < 1 || args.splatStripes > 64) {
+                std::cerr << "--splat-stripes expects 1..64\n";
+                std::exit(2);
+            }
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "Unknown option: " << a << "\n"
                       << "If this option was added recently, the binary is out "
@@ -758,14 +968,17 @@ void uploadSceneBuffers(const Scene& scene, RendererState& state)
         state.sbtOffsets.push_back((uint32_t)t.mat_id);
 }
 
-// OptiX context
-void createContext(RendererState& state)
+// OptiX context.  Validation mode adds checks to every OptiX call and makes
+// every optixLaunch synchronise, so it is only switched on when asked for
+// (--validation on): with it, every pass time includes that overhead.
+void createContext(RendererState& state, bool validation)
 {
     CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaFree(0));
     OPTIX_CHECK(optixInit());
     OptixDeviceContextOptions opt = {};
-    opt.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+    opt.validationMode = validation ? OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL
+                                    : OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_OFF;
     opt.logCallbackFunction = [](unsigned int, const char*, const char* msg, void*) { std::cerr << "[OptiX] " << msg << "\n"; };
     opt.logCallbackLevel = 4;
     CUcontext cu;
@@ -849,7 +1062,8 @@ void createModule(RendererState& state)
 // 2. shadow miss
 // 3. hitgroup
 // 4. photon tracing raygen
-// 5. gather raygen
+// 5. camera (gather pass 1) raygen
+// 6. light visualisation raygen
 
 void createProgramGroups(RendererState& state)
 {
@@ -901,14 +1115,6 @@ void createProgramGroups(RendererState& state)
     OPTIX_CHECK(optixProgramGroupCreate(state.context, &cameraRd, 1, &pgo,
         log, &ls, &state.cameraRaygenGroup));
 
-    // Gather pass 2 — photon lookup
-    OptixProgramGroupDesc queryRd = {};
-    queryRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-    queryRd.raygen.module = state.ptxModule;
-    queryRd.raygen.entryFunctionName = "__raygen__query";
-    OPTIX_CHECK(optixProgramGroupCreate(state.context, &queryRd, 1, &pgo,
-        log, &ls, &state.queryRaygenGroup));
-
     // Light visualization raygen
     OptixProgramGroupDesc lightvisRd = {};
     lightvisRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -917,49 +1123,59 @@ void createProgramGroups(RendererState& state)
     OptixProgramGroupOptions opts = {};
     OPTIX_CHECK(optixProgramGroupCreate(
         state.context, &lightvisRd, 1, &pgo, log, &ls, &state.lightvisRaygenGroup));
+
+    // Splatting's photon pass
+    OptixProgramGroupDesc splatRd = {};
+    splatRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    splatRd.raygen.module = state.ptxModule;
+    splatRd.raygen.entryFunctionName = "__raygen__photon_splat";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &splatRd, 1, &pgo,
+        log, &ls, &state.splatRaygenGroup));
+
+    // Stochastic splatting's photon pass
+    OptixProgramGroupDesc stochsplatRd = {};
+    stochsplatRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    stochsplatRd.raygen.module = state.ptxModule;
+    stochsplatRd.raygen.entryFunctionName = "__raygen__photon_stochsplat";
+    OPTIX_CHECK(optixProgramGroupCreate(state.context, &stochsplatRd, 1, &pgo,
+        log, &ls, &state.stochsplatRaygenGroup));
+
+    // The fused camera-and-lookup programs
+    const char* fusedNames[5] = { "__raygen__fused_uniform", "__raygen__fused_hash",
+        "__raygen__fused_rect", "__raygen__fused_mlhash", "__raygen__fused_mlrect" };
+    for (int i = 0; i < 5; ++i) {
+        OptixProgramGroupDesc fusedRd = {};
+        fusedRd.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+        fusedRd.raygen.module = state.ptxModule;
+        fusedRd.raygen.entryFunctionName = fusedNames[i];
+        OPTIX_CHECK(optixProgramGroupCreate(state.context, &fusedRd, 1, &pgo,
+            log, &ls, &state.fusedRaygenGroups[i]));
+    }
 }
 
-// Pipeline
-void createPipeline(RendererState& state)
+// Links `groups` into a pipeline and sizes its stacks.
+static OptixPipeline linkPipeline(RendererState& state, const OptixProgramGroup* groups,
+    uint32_t count)
 {
-    // Every program group whose SBT record can be launched must be linked into
-    // the pipeline — __raygen__lightvis was missing here, so "Photon Tracing
-    // Only" was launching a record from an unlinked group.
-    OptixProgramGroup groups[] = {
-        state.raygenGroup,
-        state.missGroup,
-        state.shadowMissGroup,
-        state.hitGroup,
-        state.photonRaygenGroup,
-        state.cameraRaygenGroup,
-        state.queryRaygenGroup,
-        state.lightvisRaygenGroup
-    };
-
     OptixPipelineLinkOptions lo = {};
     lo.maxTraceDepth = 8;
 
     char log[2048];
     size_t ls = sizeof(log);
+    OptixPipeline pipeline = nullptr;
     OPTIX_CHECK(optixPipelineCreate(
         state.context,
         &state.pipelineCompileOptions,
         &lo,
-        groups, (uint32_t)std::size(groups),
+        groups, count,
         log, &ls,
-        &state.pipeline));
+        &pipeline));
     if (ls > 1)
         std::cerr << "[OptiX Pipeline] " << log << "\n";
 
     OptixStackSizes ss = {};
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.raygenGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.missGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.shadowMissGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.hitGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.photonRaygenGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.cameraRaygenGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.queryRaygenGroup, &ss, state.pipeline));
-    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.lightvisRaygenGroup, &ss, state.pipeline));
+    for (uint32_t i = 0; i < count; ++i)
+        OPTIX_CHECK(optixUtilAccumulateStackSizes(groups[i], &ss, pipeline));
 
     uint32_t fromTraversal, fromState, continuation;
     OPTIX_CHECK(optixUtilComputeStackSizes(
@@ -969,12 +1185,57 @@ void createPipeline(RendererState& state)
         &fromTraversal, &fromState, &continuation));
 
     OPTIX_CHECK(optixPipelineSetStackSize(
-        state.pipeline,
+        pipeline,
         fromTraversal,
         fromState,
         continuation,
         2 // IAS + GAS depth
         ));
+    return pipeline;
+}
+
+// Pipelines
+void createPipeline(RendererState& state)
+{
+    // Every program group whose SBT record can be launched must be linked into
+    // the pipeline — __raygen__lightvis was missing here, so "Photon Tracing
+    // Only" was launching a record from an unlinked group.
+    const OptixProgramGroup trace[] = {
+        state.raygenGroup,
+        state.missGroup,
+        state.shadowMissGroup,
+        state.hitGroup,
+        state.photonRaygenGroup,
+        state.cameraRaygenGroup,
+        state.lightvisRaygenGroup
+    };
+    state.pipeline = linkPipeline(state, trace, (uint32_t)std::size(trace));
+
+    const OptixProgramGroup splat[] = {
+        state.splatRaygenGroup,
+        state.missGroup,
+        state.shadowMissGroup,
+        state.hitGroup
+    };
+    state.splatPipeline = linkPipeline(state, splat, (uint32_t)std::size(splat));
+
+    const OptixProgramGroup stochsplat[] = {
+        state.stochsplatRaygenGroup,
+        state.missGroup,
+        state.shadowMissGroup,
+        state.hitGroup
+    };
+    state.stochsplatPipeline = linkPipeline(state, stochsplat, (uint32_t)std::size(stochsplat));
+
+    for (int i = 0; i < 5; ++i) {
+        const OptixProgramGroup fused[] = {
+            state.fusedRaygenGroups[i],
+            state.missGroup,
+            state.shadowMissGroup,
+            state.hitGroup
+        };
+        state.fusedPipelines[i] = linkPipeline(state, fused, (uint32_t)std::size(fused));
+    }
 }
 
 // SBT layout (miss records must match missSbtOffset used in optixTrace):
@@ -1057,18 +1318,31 @@ void createSBT(RendererState& state)
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_photon),
         &rgPhoton, sizeof(rgPhoton), cudaMemcpyHostToDevice));
 
-    // Gather raygen SBT records — one per pass
+    // Gather pass 1 (camera) raygen SBT record
     SbtRecord<RayGenData> rgCamera = {};
     OPTIX_CHECK(optixSbtRecordPackHeader(state.cameraRaygenGroup, &rgCamera));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_camera), sizeof(rgCamera)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_camera),
         &rgCamera, sizeof(rgCamera), cudaMemcpyHostToDevice));
 
-    SbtRecord<RayGenData> rgQuery = {};
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.queryRaygenGroup, &rgQuery));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_query), sizeof(rgQuery)));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_query),
-        &rgQuery, sizeof(rgQuery), cudaMemcpyHostToDevice));
+    // Splatting's photon pass
+    SbtRecord<RayGenData> rgSplat = {};
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.splatRaygenGroup, &rgSplat));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_splat), sizeof(rgSplat)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_splat),
+        &rgSplat, sizeof(rgSplat), cudaMemcpyHostToDevice));
+    SbtRecord<RayGenData> rgStochsplat = {};
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.stochsplatRaygenGroup, &rgStochsplat));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_stochsplat), sizeof(rgStochsplat)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_stochsplat),
+        &rgStochsplat, sizeof(rgStochsplat), cudaMemcpyHostToDevice));
+    for (int i = 0; i < 5; ++i) {
+        SbtRecord<RayGenData> rgFused = {};
+        OPTIX_CHECK(optixSbtRecordPackHeader(state.fusedRaygenGroups[i], &rgFused));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.drg_fused[i]), sizeof(rgFused)));
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.drg_fused[i]),
+            &rgFused, sizeof(rgFused), cudaMemcpyHostToDevice));
+    }
 
     // Light visualization raygen SBT record
     SbtRecord<RayGenData> rgLightvis = {};
@@ -1175,6 +1449,8 @@ static void updatePPMRadius(Params& p)
 {
     if (p.use_ppm)
         p.gather_radius = ppmRadius(p.ppm_radius_initial, p.ppm_alpha, p.frame_index);
+    // The same schedule as a factor, for the per-pixel radius.
+    p.radius_scale = p.use_ppm ? ppmRadius(1.f, p.ppm_alpha, p.frame_index) : 1.f;
 }
 
 // The host-side grid build this replaced.  Kept, commented, because it is the
@@ -1329,7 +1605,7 @@ static void updatePPMRadius(Params& p)
 
 static bool saveEXR(const std::string& filename,
                     const std::vector<float3>& hdr,
-                    int width, int height) {
+                    int width, int height, bool fullFloat = false) {
     std::vector<float> images[3];
     images[0].resize(width * height);
     images[1].resize(width * height);
@@ -1374,7 +1650,8 @@ static bool saveEXR(const std::string& filename,
     header.requested_pixel_types = (int*)malloc(sizeof(int) * header.num_channels);
     for (int i = 0; i < 3; ++i) {
         header.pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
-        header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_HALF; // или FLOAT
+        header.requested_pixel_types[i] = fullFloat ? TINYEXR_PIXELTYPE_FLOAT
+                                                    : TINYEXR_PIXELTYPE_HALF;
     }
 
     const char* err = nullptr;
@@ -1441,14 +1718,121 @@ struct FrameTimings {
     float photon_trace = 0.f;
     float build = 0.f; // acceleration-structure build
     float camera = 0.f;
+    float mark = 0.f; // culling only: clearing the mask and marking the cells
     float query = 0.f;
+    float finalize = 0.f; // splatting: flux -> radiance (its build and photon
+                          // pass are `build` and `photon_trace`)
+    float fused = 0.f; // --fused: the camera walk and the lookup in one pass
     float accum = 0.f;
+    long long vp_entries = 0; // splatting: (visible point, cell) entries filed
+    long long vp_unique = 0; //   ... after removing a point's repeats in a bucket
+    long long reached = 0; //   ... deposits that reached a visible point
+    long long pairs = 0; //   ... (deposit, visible point) pairs = atomic triples
     float radius = 0.f;
     long long cells = 0; // uniform grid only
-    long long buckets = 0; // hash grid only
-    int photons = 0;
-    float total() const { return photon_trace + build + camera + query + accum; }
+    long long buckets = 0; // hash grids only
+    int photons = 0; // stored
+    long long deposits = 0; // photons deposited before culling (= photons without it)
+    float culled = 0.f; // fraction of the deposits culling turned away
+    float r_max = 0.f; // largest lookup radius of the frame (in footprint mode
+    float r_mean = 0.f; // the reduction over the gather points provides these
+    float r_px_mean = 0.f; // three; in global mode r is the same everywhere)
+    long long entries = 0; // multi-level grids: (photon, level) pairs filed
+    long long bytes = 0; // memory of the structure the lookup reads
+    int num_levels = 0; // levels in use (read back only when something needs them)
+    int level_min = -1;
+    int level_max = -1;
+    QueryStatSummary tested; // --stats: photon records each lookup tested
+    QueryStatSummary accepted; //   ... and how many it accepted
+    QueryStatSummary cells_visited; //   ... and how many cells it visited
+    float total() const { return photon_trace + build + camera + mark + query + finalize + fused + accum; }
 };
+
+// Selected with --culling or the GUI; params.culling is what a frame uses,
+// which is this only while the photon map is retraced for the frame's own
+// lookups (photon mapping, retrace on).
+static bool gCulling = false;
+
+// --rect-buckets: the multi-level rectified grid's table size (a power of
+// two); 0 = sized from the photon count.
+static long long gRectBuckets = 0;
+
+// --mlrect-in-trace: the photon pass fills the multi-level rectified grid.
+static bool gMlrectInTrace = false;
+
+// --fused: camera walk and lookup in one program (offline, family A).
+static bool gFused = false;
+
+// The fused program of a structure, or -1.
+static int fusedIndex(AccelType a)
+{
+    switch (a) {
+    case ACCEL_UNIFORM_GRID:
+        return 0;
+    case ACCEL_HASH_GRID:
+        return 1;
+    case ACCEL_RECTIFIED_HASH_GRID:
+        return 2;
+    case ACCEL_MLHASH:
+        return 3;
+    case ACCEL_MLRECT:
+        return 4;
+    default:
+        return -1;
+    }
+}
+
+// What the timings were measured on, recorded with them: a Debug build or
+// OptiX validation moves every pass time, and so do the GPU and its driver.
+struct RunEnvironment {
+    std::string buildType;
+    bool validation = false;
+    std::string gpu;
+    std::string driver;
+    int cudaDriverApi = 0;
+    int cudaRuntime = 0;
+};
+static RunEnvironment gEnv;
+
+#ifndef RENDERER_BUILD_TYPE
+#define RENDERER_BUILD_TYPE ""
+#endif
+
+static RunEnvironment queryEnvironment(bool validation)
+{
+    RunEnvironment e;
+    e.buildType = RENDERER_BUILD_TYPE[0] ? RENDERER_BUILD_TYPE : "unspecified";
+    e.validation = validation;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess)
+        e.gpu = prop.name;
+    cudaDriverGetVersion(&e.cudaDriverApi);
+    cudaRuntimeGetVersion(&e.cudaRuntime);
+    // The kernel module's own version string, "... Kernel Module  595.99.02  ...".
+    std::ifstream in("/proc/driver/nvidia/version");
+    std::string line;
+    if (std::getline(in, line)) {
+        const size_t k = line.find("Kernel Module");
+        if (k != std::string::npos) {
+            std::istringstream words(line.substr(k + 13));
+            words >> e.driver;
+        }
+    }
+    if (e.driver.empty())
+        e.driver = "CUDA driver API " + std::to_string(e.cudaDriverApi);
+    return e;
+}
+
+static std::string jsonString(const std::string& s)
+{
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\')
+            out += '\\';
+        out += c;
+    }
+    return out + "\"";
+}
 
 // The structure the gather searches the photon map with, set by --accel or the
 // GUI.  params.accel is what the device actually uses for a given frame; it is
@@ -1457,6 +1841,11 @@ struct FrameTimings {
 //
 // ACCEL_BRUTE_FORCE builds nothing and tests every photon in the map.  It is
 // slow by construction: it is the reference the structures are checked against.
+//
+// The two stochastic hash grids are not exact structures but estimators: they
+// keep one photon per bucket, so they do not find the same photons as brute
+// force, only the same sum in expectation (the rectified one) or not even that
+// (the original one — its pick is biased, which is what it is here to show).
 static AccelType gAccel = ACCEL_UNIFORM_GRID;
 
 static const char* accelName(AccelType a)
@@ -1466,8 +1855,22 @@ static const char* accelName(AccelType a)
         return "brute";
     case ACCEL_HASH_GRID:
         return "hash";
+    case ACCEL_STOCHASTIC_HASH_GRID:
+        return "stochastic";
+    case ACCEL_RECTIFIED_HASH_GRID:
+        return "rect";
+    case ACCEL_MLHASH:
+        return "mlhash";
+    case ACCEL_MLRECT:
+        return "mlrect";
+    case ACCEL_SPLAT:
+        return "splat";
+    case ACCEL_MLSPLAT:
+        return "mlsplat";
+    case ACCEL_STOCHSPLAT:
+        return "stochsplat";
     default:
-        return "grid";
+        return "uniform";
     }
 }
 
@@ -1478,38 +1881,98 @@ static const char* accelLabel(AccelType a)
         return "brute force";
     case ACCEL_HASH_GRID:
         return "hash grid";
+    case ACCEL_STOCHASTIC_HASH_GRID:
+        return "stochastic hash grid";
+    case ACCEL_RECTIFIED_HASH_GRID:
+        return "rectified stochastic hash grid";
+    case ACCEL_MLHASH:
+        return "multi-level hash grid";
+    case ACCEL_MLRECT:
+        return "multi-level rectified hash grid";
+    case ACCEL_SPLAT:
+        return "splatting into a hash grid of visible points";
+    case ACCEL_MLSPLAT:
+        return "splatting into a multi-level hash grid of visible points";
+    case ACCEL_STOCHSPLAT:
+        return "stochastic splatting into one of the visible points reached";
     default:
         return "uniform grid";
     }
 }
 
+// The structures that keep one photon per bucket estimate the sum a lookup
+// is after rather than computing it, so there is no image to compare them
+// with pixel by pixel; they are checked by averaging many frames instead.
+static bool estimatesOnly(AccelType a)
+{
+    return isStochasticHashGrid(a) || a == ACCEL_MLRECT || a == ACCEL_STOCHSPLAT;
+}
+
+// <family>/<accel>/<radius mode>, the name a configuration goes by in logs and
+// reports: family A gathers from the full photon map, family B from a map
+// culled to what the frame's lookups can reach, family C splats the photons
+// into the visible points (culled implicitly: only photons that reach one
+// count).  E.g. B/mlhash/footprint, C/mlsplat/footprint.
+static const char* familyName(AccelType a, bool culling)
+{
+    return isSplatting(a) ? "C" : (culling ? "B" : "A");
+}
+
+static std::string configName(AccelType a, bool culling, int radiusMode)
+{
+    return std::string(familyName(a, culling)) + "/" + accelName(a)
+        + (radiusMode == RADIUS_FOOTPRINT ? "/footprint" : "/global");
+}
+
 static bool parseAccel(const std::string& s, AccelType& out)
 {
-    if (s == "grid") {
+    if (s == "grid" || s == "uniform") {
         out = ACCEL_UNIFORM_GRID;
     } else if (s == "hash") {
         out = ACCEL_HASH_GRID;
+    } else if (s == "stochastic") {
+        out = ACCEL_STOCHASTIC_HASH_GRID;
+    } else if (s == "rect" || s == "rectified") {
+        out = ACCEL_RECTIFIED_HASH_GRID;
     } else if (s == "brute") {
         out = ACCEL_BRUTE_FORCE;
+    } else if (s == "mlhash") {
+        out = ACCEL_MLHASH;
+    } else if (s == "mlrect") {
+        out = ACCEL_MLRECT;
+    } else if (s == "splat") {
+        out = ACCEL_SPLAT;
+    } else if (s == "mlsplat") {
+        out = ACCEL_MLSPLAT;
+    } else if (s == "stochsplat") {
+        out = ACCEL_STOCHSPLAT;
     } else {
         return false;
     }
     return true;
 }
 
-void launchPathTracing(RendererState& state, Params& p, CUstream& stream) {
+// One path-traced frame; returns its GPU time, timed like the photon-mapping
+// passes (for --checkpoints).
+float launchPathTracing(RendererState& state, Params& p, CUstream& stream) {
+    static GpuTimer timer;
     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams),
                                 &p, sizeof(Params),
                                 cudaMemcpyHostToDevice, stream));
+    timer.start(stream);
     OPTIX_CHECK(optixLaunch(state.pipeline, stream,
                             state.dParams, sizeof(Params),
                             &state.sbt, p.width, p.height, 1));
+    const float ms = timer.stopMs(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    return ms;
 }
 
 static bool tracePhotonsOnce(RendererState& state, Params& p, CUstream stream, int& deposits)
 {
     CUDA_CHECK(cudaMemsetAsync(p.photon_count, 0, sizeof(int), stream));
+    if (p.culling)
+        CUDA_CHECK(cudaMemsetAsync(p.deposit_counts, 0, 2 * sizeof(int), stream));
 
     OptixShaderBindingTable sbtPhoton = state.sbt;
     sbtPhoton.raygenRecord = state.drg_photon;
@@ -1526,10 +1989,42 @@ static bool tracePhotonsOnce(RendererState& state, Params& p, CUstream stream, i
 
 // Traces one full photon pass and rebuilds the lookup grid.
 // Returns the number of photons actually stored.
+//
+// The stochastic hash grids turn the order around: the photon pass fills them
+// as it deposits, so their table is cleared *before* the trace and nothing is
+// built after it.  Clearing is all their "build" is; the filing itself is part
+// of photon_trace, as in Davidovič et al. (2014, table V).
 int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream,
     FrameTimings* timings = nullptr)
 {
     static GpuTimer traceTimer, buildTimer;
+
+    const bool stochastic = isStochasticHashGrid(gAccel);
+    // --mlrect-in-trace: the multi-level rectified grid is filled by the
+    // photon pass too, so it is prepared before the trace like the stochastic
+    // grids and has no build after it.
+    const bool rectInTrace = gAccel == ACCEL_MLRECT && gMlrectInTrace;
+    p.mlrect_in_trace = rectInTrace ? 1 : 0;
+    float buildMs = 0.f;
+    GridBuildStats stats;
+
+    // The largest radius any lookup of this frame uses — the camera pass ran
+    // first and worked it out.  The single-level grids size their cells by it.
+    const float gridRadius = p.max_gather_radius > 0.f ? p.max_gather_radius : p.gather_radius;
+    if (stochastic) {
+        buildTimer.start(stream);
+        prepareStochasticHashGridGPU(p, gAccel, gridRadius, state.grid, stream, &stats);
+        buildMs = buildTimer.stopMs(stream);
+    } else if (rectInTrace) {
+        buildTimer.start(stream);
+        prepareMultiLevelRectGridForTraceGPU(p, gRectBuckets, state.grid, stream, &stats);
+        buildMs = buildTimer.stopMs(stream);
+    } else {
+        // __raygen__photon fills a stochastic grid whenever p.accel names
+        // one, so the first frame after switching away from one must not trace
+        // with it still set.
+        p.accel = gAccel;
+    }
 
     traceTimer.start(stream);
     int deposits = 0;
@@ -1542,6 +2037,13 @@ int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream,
         p.photon_capacity = int(std::min<size_t>(need, kMaxPhotonSlots));
         CUDA_CHECK(cudaMalloc(&p.photon_map, size_t(p.photon_capacity) * sizeof(Photon)));
 
+        // A stochastic table now holds the saturated pass's photons, and is
+        // sized from the old capacity.
+        if (stochastic)
+            prepareStochasticHashGridGPU(p, gAccel, gridRadius, state.grid, stream, &stats);
+        else if (rectInTrace)
+            prepareMultiLevelRectGridForTraceGPU(p, gRectBuckets, state.grid, stream, &stats);
+
         if (!tracePhotonsOnce(state, p, stream, deposits))
             std::cerr << "[Photons] STILL saturated — lower num_photon_paths\n";
     }
@@ -1549,17 +2051,51 @@ int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream,
 
     const int stored = std::min(deposits, p.photon_capacity);
 
-    float buildMs = 0.f;
-    GridBuildStats stats;
-    if (gAccel == ACCEL_BRUTE_FORCE) {
+    // Culling statistics, read after the trace is timed: they cost the
+    // render nothing.  Without culling every deposit is kept.
+    long long allDeposits = deposits;
+    if (p.culling) {
+        int counts[2] = { 0, 0 };
+        CUDA_CHECK(cudaMemcpy(counts, p.deposit_counts, sizeof(counts),
+            cudaMemcpyDeviceToHost));
+        allDeposits = counts[0];
+        // The kept count is photon_count again, tallied per path instead of
+        // per slot; if the two disagree, a path skipped its tally.
+        if (counts[1] != deposits)
+            std::cerr << "\n[Culling] kept " << counts[1] << " but stored "
+                      << deposits << " — the per-path counts are off\n";
+    }
+
+    if (stochastic) {
+        // already filled by the trace
+    } else if (gAccel == ACCEL_BRUTE_FORCE) {
         p.accel = ACCEL_BRUTE_FORCE;
     } else if (gAccel == ACCEL_HASH_GRID) {
         buildTimer.start(stream);
-        buildPhotonHashGridGPU(p, stored, state.grid, stream, &stats);
+        buildPhotonHashGridGPU(p, stored, gridRadius, state.grid, stream, &stats);
         buildMs = buildTimer.stopMs(stream);
+    } else if (gAccel == ACCEL_MLHASH) {
+        buildTimer.start(stream);
+        buildMultiLevelHashGridGPU(p, stored, state.grid, stream, &stats);
+        buildMs = buildTimer.stopMs(stream);
+    } else if (rectInTrace) {
+        // already filled by the trace; the insertions are counted only for
+        // the statistics
+        if (timings)
+            stats.entries = p.culling ? countMultiLevelRectEntries(p, state.grid, stream)
+                                      : (long long)stored * p.num_levels;
+    } else if (gAccel == ACCEL_MLRECT) {
+        buildTimer.start(stream);
+        buildMultiLevelRectGridGPU(p, stored, gRectBuckets, state.grid, stream, &stats);
+        buildMs = buildTimer.stopMs(stream);
+        // With culling the build counts its insertions to size the table,
+        // unless --rect-buckets fixed the size; then they are counted here,
+        // after the build is timed: it is statistics.
+        if (p.culling && p.accel == ACCEL_MLRECT && timings && stats.entries == 0)
+            stats.entries = countMultiLevelRectEntries(p, state.grid, stream);
     } else {
         buildTimer.start(stream);
-        buildPhotonGridGPU(p, stored, state.grid, stream, &stats);
+        buildPhotonGridGPU(p, stored, gridRadius, state.grid, stream, &stats);
         buildMs = buildTimer.stopMs(stream);
 
         // The cell budget is a silent change of what is being measured, so say
@@ -1584,10 +2120,15 @@ int launchPhotonTracing(RendererState& state, Params& p, CUstream& stream,
     if (timings) {
         timings->photon_trace = traceMs;
         timings->build = buildMs;
-        timings->radius = p.gather_radius;
+        timings->radius = gridRadius;
         timings->cells = stats.cells;
         timings->buckets = stats.buckets;
         timings->photons = stored;
+        timings->deposits = allDeposits;
+        timings->entries = stats.entries;
+        timings->bytes = stats.bytes;
+        timings->culled = allDeposits > 0
+            ? float(1.0 - double(deposits) / double(allDeposits)) : 0.f;
     }
     return stored;
 }
@@ -1644,20 +2185,295 @@ static float launchPixelPass(RendererState& state, Params& p, CUstream& stream,
     return ms;
 }
 
-// Gather pass 1: camera walk -> one GatherPoint per pixel.
-float launchCameraPass(RendererState& state, Params& p, CUstream& stream)
+// The device buffers culling needs, sized for p.cull_mask_bits.
+static void ensureCullingBuffers(RendererState& state, Params& p)
 {
-    static GpuTimer timer;
-    // Photon mapping is one camera sample per frame; see Params::samples_per_pixel.
-    p.samples_per_pixel = 1;
-    return launchPixelPass(state, p, stream, state.drg_camera, timer);
+    if (!state.dUsedLevels) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dUsedLevels),
+            MAX_LEVELS * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dDepositCounts),
+            2 * sizeof(int)));
+    }
+    const size_t maskBytes = (size_t(1) << p.cull_mask_bits) / 8;
+    if (state.cullMaskBytes != maskBytes) {
+        if (state.dCullMask)
+            CUDA_CHECK(cudaFree(state.dCullMask));
+        if (state.dCullParent)
+            CUDA_CHECK(cudaFree(state.dCullParent));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dCullMask), maskBytes));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.dCullParent), maskBytes));
+        state.cullMaskBytes = maskBytes;
+    }
+    p.cull_mask = state.dCullMask;
+    p.cull_parent = state.dCullParent;
+    p.deposit_counts = state.dDepositCounts;
 }
 
-// Gather pass 2: the photon lookup -> one radiance per pixel.
-float launchQueryPass(RendererState& state, Params& p, CUstream& stream)
+// Gather pass 1: camera walk -> one GatherPoint per pixel.
+//
+// With culling or a multi-level grid the pass also flags the levels its
+// lookups use, which are read back here (32 ints) and handed to the photon
+// pass and the build as a list; the cells to keep are marked afterwards, by
+// launchMarkPass.  In footprint mode every pixel has its own radius, and
+// the largest of them — what a single-level grid has to size its cells by —
+// is reduced on the device and read back here.  What a structure needs before
+// it can be built is part of its cost, so it is timed with the pass; the same
+// reduction run only for the statistics (mean radius, radius in pixels) is
+// not.  In global mode without culling none of this runs.
+float launchCameraPass(RendererState& state, Params& p, CUstream& stream,
+    FrameTimings* timings = nullptr)
+{
+    static GpuTimer timer, outerTimer;
+    // Photon mapping is one camera sample per frame; see Params::samples_per_pixel.
+    p.samples_per_pixel = 1;
+
+    // In global mode every lookup uses gather_radius.
+    p.max_gather_radius = p.gather_radius;
+    if (timings)
+        timings->r_max = timings->r_mean = p.gather_radius;
+
+    // mlsplat files its points on levels of its own (the build finds them),
+    // but its exact counterpart in --verify-gather, mlhash, needs these.
+    const bool needLevels = p.culling != 0 || isMultiLevelGrid(gAccel) || gAccel == ACCEL_MLSPLAT
+        || gFused;
+    const bool footprint = p.radius_mode == RADIUS_FOOTPRINT;
+    // Only a single-level grid needs the largest radius before it can be
+    // built — single-level splatting too, whose cells are F times it.
+    // Everyone else gets the radii reduced for the statistics only (always in
+    // footprint mode, with --stats in global mode too), after the pass's time
+    // is taken.
+    const bool needMaxRadius = footprint
+        && (gAccel == ACCEL_UNIFORM_GRID || gAccel == ACCEL_HASH_GRID
+            || isStochasticHashGrid(gAccel) || gAccel == ACCEL_SPLAT || gFused);
+    const bool wantRadii = footprint || p.stats;
+
+    GatherRadiusStats radii;
+    bool haveRadii = false;
+    float ms = 0.f;
+    if (!needLevels && !needMaxRadius) {
+        p.used_levels = nullptr;
+        ms = launchPixelPass(state, p, stream, state.drg_camera, timer);
+    } else {
+        if (needLevels) {
+            ensureCullingBuffers(state, p);
+            p.used_levels = state.dUsedLevels;
+        } else {
+            p.used_levels = nullptr;
+        }
+
+        outerTimer.start(stream);
+        if (needLevels)
+            CUDA_CHECK(cudaMemsetAsync(p.used_levels, 0, MAX_LEVELS * sizeof(int), stream));
+        launchPixelPass(state, p, stream, state.drg_camera, timer);
+        int used[MAX_LEVELS] = {};
+        if (needLevels)
+            CUDA_CHECK(cudaMemcpyAsync(used, p.used_levels, sizeof(used),
+                cudaMemcpyDeviceToHost, stream));
+        if (needMaxRadius) {
+            reduceGatherRadii(p, state.grid, stream, radii);
+            haveRadii = true;
+        }
+        ms = outerTimer.stopMs(stream);
+
+        if (needLevels) {
+            p.num_levels = 0;
+            for (int l = 0; l < MAX_LEVELS; ++l)
+                if (used[l])
+                    p.levels[p.num_levels++] = l;
+            if (timings) {
+                timings->num_levels = p.num_levels;
+                timings->level_min = p.num_levels ? p.levels[0] : -1;
+                timings->level_max = p.num_levels ? p.levels[p.num_levels - 1] : -1;
+            }
+        }
+    }
+
+    if (wantRadii && !haveRadii) {
+        reduceGatherRadii(p, state.grid, stream, radii);
+        haveRadii = true;
+    }
+    if (haveRadii) {
+        // No valid gather point, no lookup: any cell size will do.
+        if (footprint && radii.max_r > 0.f)
+            p.max_gather_radius = radii.max_r;
+        if (timings) {
+            timings->r_max = radii.max_r;
+            timings->r_mean = radii.valid ? float(radii.sum_r / double(radii.valid)) : 0.f;
+            timings->r_px_mean = radii.valid ? float(radii.sum_px / double(radii.valid)) : 0.f;
+        }
+    }
+    return ms;
+}
+
+// Photon culling, the lookup side: clear the mask and mark every cell this
+// frame's lookups will search.  It runs after the camera pass because the
+// marks come from the gather points that pass wrote; see
+// markLookupCellsKernel.  Its time is culling's own cost on the lookup side,
+// which is why it is a pass of its own and not part of the camera walk.
+float launchMarkPass(RendererState& state, Params& p, CUstream& stream)
 {
     static GpuTimer timer;
-    return launchPixelPass(state, p, stream, state.drg_query, timer);
+    timer.start(stream);
+    CUDA_CHECK(cudaMemsetAsync(p.cull_mask, 0, state.cullMaskBytes, stream));
+    if (p.hier_mask)
+        CUDA_CHECK(cudaMemsetAsync(p.cull_parent, 0, state.cullMaskBytes, stream));
+    launchMarkKernel(p, stream);
+    return timer.stopMs(stream);
+}
+
+// Gather pass 2: the photon lookup -> one radiance per pixel.  A CUDA kernel
+// per structure (launchQueryKernel), timed like the OptiX passes.
+float launchQueryPass(RendererState&, Params& p, CUstream& stream)
+{
+    static GpuTimer timer;
+    timer.start(stream);
+    launchQueryKernel(p, stream);
+    return timer.stopMs(stream);
+}
+
+// The splatting family's frame after the camera pass: file the visible points
+// (timed as the build), splat every photon deposit into them (the photon
+// pass: clearing the accumulators, uploading the parameters and the launch,
+// as the storing photon pass is timed with its counter reset and upload), and
+// turn their flux into radiance (finalize).  Nothing is stored, so nothing
+// waits on a photon count.
+static void launchSplatPasses(RendererState& state, Params& p, CUstream& stream, FrameTimings* ft)
+{
+    static GpuTimer buildTimer, splatTimer, finalizeTimer;
+
+    // splat: one cell size, F times the frame's largest radius (the camera
+    // pass reduced it); mlsplat: a level per point, from its own radius.
+    p.vpgrid.cell_size = (gAccel == ACCEL_SPLAT) ? p.splat_cell_factor * p.max_gather_radius : 0.f;
+    const bool stochastic = gAccel == ACCEL_STOCHSPLAT;
+    VpGridStats vs;
+    buildTimer.start(stream);
+    buildVisiblePointGridGPU(p, state.grid, stream, &vs);
+    const float buildMs = buildTimer.stopMs(stream);
+
+    const size_t points = size_t(p.width) * p.height;
+    OptixShaderBindingTable sbt = state.sbt;
+    sbt.raygenRecord = stochastic ? state.drg_stochsplat : state.drg_splat;
+    splatTimer.start(stream);
+    CUDA_CHECK(cudaMemsetAsync(p.splat_acc, 0, size_t(p.splat_stripes) * points * 3 * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(p.splat_counts, 0, 3 * sizeof(unsigned long long), stream));
+    if (p.stats)
+        CUDA_CHECK(cudaMemsetAsync(p.stat_slot, 0, sizeof(int), stream));
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params),
+        cudaMemcpyHostToDevice, stream));
+    OPTIX_CHECK(optixLaunch(stochastic ? state.stochsplatPipeline : state.splatPipeline, stream,
+        state.dParams, sizeof(Params), &sbt, (unsigned)p.num_photon_paths, 1, 1));
+    const float splatMs = splatTimer.stopMs(stream);
+
+    finalizeTimer.start(stream);
+    launchSplatFinalize(p, stream);
+    const float finalizeMs = finalizeTimer.stopMs(stream);
+
+    if (ft) {
+        unsigned long long counts[3] = { 0, 0, 0 };
+        CUDA_CHECK(cudaMemcpy(counts, p.splat_counts, sizeof(counts), cudaMemcpyDeviceToHost));
+        ft->build = buildMs;
+        ft->photon_trace = splatMs;
+        ft->finalize = finalizeMs;
+        ft->radius = p.max_gather_radius;
+        ft->photons = 0; // nothing is stored
+        ft->deposits = (long long)counts[0];
+        ft->reached = (long long)counts[1];
+        ft->pairs = (long long)counts[2];
+        ft->vp_entries = vs.entries;
+        ft->vp_unique = vs.unique;
+        ft->entries = vs.unique;
+        ft->buckets = vs.buckets;
+        ft->bytes = vs.bytes;
+        ft->num_levels = vs.num_levels;
+        ft->level_min = vs.level_min;
+        ft->level_max = vs.level_max;
+    }
+}
+
+// What a --fused frame sizes its structure from: the frame before's largest
+// radius and PPM factor, and the levels its lookups used.
+struct FusedHistory {
+    bool valid = false;
+    float max_r = 0.f;
+    float scale = 1.f;
+    int num_levels = 0;
+    int levels[MAX_LEVELS] = {};
+};
+
+static void rememberForFused(const Params& p, FusedHistory& hist)
+{
+    hist.valid = true;
+    hist.max_r = p.max_gather_radius;
+    hist.scale = p.radius_scale;
+    hist.num_levels = p.num_levels;
+    for (int i = 0; i < MAX_LEVELS; ++i)
+        hist.levels[i] = p.levels[i];
+}
+
+// One --fused frame (family A): the structure first, sized without this
+// frame's gather points — the single-level grids' cells from the frame
+// before's largest radius times this frame's PPM shrink s_i / s_{i-1} (in
+// global mode the radius is known exactly), the multi-level grids' levels
+// from the ones the frame before used, with one more on either side — then the
+// camera walk and the lookup in one program (__raygen__fused_*), which
+// records this frame's largest radius and levels for the next.  A lookup
+// whose cells turn out narrower than its radius, or whose level was not
+// built, still finds exactly its photons (see fusedCameraGather).  The
+// fused pass is timed with the readback of what it recorded.
+static void launchFusedFrame(RendererState& state, Params& p, CUstream& stream, FrameTimings* ft,
+    FusedHistory& hist)
+{
+    static GpuTimer timer;
+    p.culling = 0;
+    p.max_gather_radius = (p.radius_mode == RADIUS_FOOTPRINT)
+        ? hist.max_r * (p.radius_scale / hist.scale) : p.gather_radius;
+    int flags[MAX_LEVELS] = {};
+    for (int i = 0; i < hist.num_levels; ++i)
+        for (int d = -1; d <= 1; ++d) {
+            const int l = hist.levels[i] + d;
+            if (l >= 0 && l < MAX_LEVELS)
+                flags[l] = 1;
+        }
+    p.num_levels = 0;
+    for (int l = 0; l < MAX_LEVELS; ++l)
+        if (flags[l])
+            p.levels[p.num_levels++] = l;
+
+    launchPhotonTracing(state, p, stream, ft);
+
+    ensureCullingBuffers(state, p);
+    p.used_levels = state.dUsedLevels;
+    const int k = fusedIndex(gAccel);
+    OptixShaderBindingTable sbt = state.sbt;
+    sbt.raygenRecord = state.drg_fused[k];
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(state.dParams), &p, sizeof(Params),
+        cudaMemcpyHostToDevice, stream));
+    int used[MAX_LEVELS] = {};
+    unsigned int maxBits = 0;
+    timer.start(stream);
+    CUDA_CHECK(cudaMemsetAsync(p.used_levels, 0, MAX_LEVELS * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(p.fused_max_r, 0, sizeof(unsigned int), stream));
+    OPTIX_CHECK(optixLaunch(state.fusedPipelines[k], stream, state.dParams, sizeof(Params), &sbt,
+        p.width, p.height, 1));
+    CUDA_CHECK(cudaMemcpyAsync(used, p.used_levels, sizeof(used), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(&maxBits, p.fused_max_r, sizeof(maxBits), cudaMemcpyDeviceToHost, stream));
+    const float ms = timer.stopMs(stream);
+
+    float maxR = 0.f;
+    std::memcpy(&maxR, &maxBits, sizeof(maxR));
+    hist.max_r = maxR > 0.f ? maxR : p.max_gather_radius;
+    hist.scale = p.radius_scale;
+    hist.num_levels = 0;
+    for (int l = 0; l < MAX_LEVELS; ++l)
+        if (used[l])
+            hist.levels[hist.num_levels++] = l;
+    if (ft) {
+        ft->fused = ms;
+        ft->num_levels = p.num_levels;
+        ft->level_min = p.num_levels ? p.levels[0] : -1;
+        ft->level_max = p.num_levels ? p.levels[p.num_levels - 1] : -1;
+        ft->r_max = maxR;
+    }
 }
 
 // Fold the query result into the accumulation buffer and tone-map it.
@@ -1762,15 +2578,36 @@ static void reportTimings(const std::vector<FrameTimings>& timings,
     long long cells = 0;
     long long buckets = 0;
     long long photons = 0;
+    long long deposits = 0;
+    double rMax = 0.0, rMean = 0.0, rPx = 0.0;
+    double entries = 0.0, bytes = 0.0, levels = 0.0;
+    int levelMin = MAX_LEVELS, levelMax = -1;
     for (int i = skip; i < n; ++i) {
         sum.photon_trace += timings[i].photon_trace;
         sum.build += timings[i].build;
         sum.camera += timings[i].camera;
+        sum.mark += timings[i].mark;
         sum.query += timings[i].query;
+        sum.finalize += timings[i].finalize;
+        sum.fused += timings[i].fused;
         sum.accum += timings[i].accum;
+        sum.vp_entries += timings[i].vp_entries;
+        sum.vp_unique += timings[i].vp_unique;
+        sum.reached += timings[i].reached;
+        sum.pairs += timings[i].pairs;
         cells += timings[i].cells;
         buckets += timings[i].buckets;
         photons += timings[i].photons;
+        deposits += timings[i].deposits;
+        rMax += timings[i].r_max;
+        rMean += timings[i].r_mean;
+        rPx += timings[i].r_px_mean;
+        entries += double(timings[i].entries);
+        bytes += double(timings[i].bytes);
+        levels += timings[i].num_levels;
+        if (timings[i].level_min >= 0)
+            levelMin = std::min(levelMin, timings[i].level_min);
+        levelMax = std::max(levelMax, timings[i].level_max);
     }
     const float inv = 1.f / float(n - skip);
     const double invd = 1.0 / double(n - skip);
@@ -1778,23 +2615,86 @@ static void reportTimings(const std::vector<FrameTimings>& timings,
     std::cout << "[Timing] " << (n - skip) << " frames"
               << " (" << skip << " warm-up skipped)"
               << ", " << p.width << "x" << p.height
-              << ", structure = " << accelLabel(gAccel)
+              << ", " << configName(gAccel, gCulling, p.radius_mode)
+              << " (" << accelLabel(gAccel) << ")"
               << "\n         mean ms/frame:"
-              << "\n           photon trace  " << sum.photon_trace * inv
-              << "\n           build         " << sum.build * inv
-              << "\n           camera pass   " << sum.camera * inv
-              << "\n           query pass    " << sum.query * inv
-              << "\n           accumulate    " << sum.accum * inv
+              << "\n           camera pass   " << sum.camera * inv;
+    if (isSplatting(gAccel)) {
+        std::cout << "\n           point grid    " << sum.build * inv
+                  << "\n           splat photons " << sum.photon_trace * inv
+                  << "\n           finalize      " << sum.finalize * inv;
+    } else {
+        if (gCulling)
+            std::cout << "\n           mark pass     " << sum.mark * inv;
+        std::cout << "\n           photon trace  " << sum.photon_trace * inv
+                  << "\n           build         " << sum.build * inv
+                  << "\n           query pass    " << sum.query * inv;
+        if (sum.fused > 0.f)
+            std::cout << "\n           fused pass    " << sum.fused * inv
+                      << "  (camera walk and lookup, after the first frame)";
+    }
+    std::cout << "\n           accumulate    " << sum.accum * inv
               << "\n           ------------------------"
               << "\n           total         " << sum.total() * inv
               << "\n         mean photons/frame " << double(photons) * invd;
     if (gAccel == ACCEL_UNIFORM_GRID)
         std::cout << ", mean cells " << double(cells) * invd;
-    else if (gAccel == ACCEL_HASH_GRID)
+    else if (gAccel != ACCEL_BRUTE_FORCE)
         std::cout << ", mean buckets " << double(buckets) * invd;
     std::cout << "\n";
-    if (args.verifyGather)
+    if (isSplatting(gAccel))
+        std::cout << "         splatting: mean deposits/frame " << double(deposits) * invd
+                  << ", " << (deposits > 0 ? 100.0 * double(sum.reached) / double(deposits) : 0.0)
+                  << "% reaching a visible point, " << double(sum.pairs) * invd << " pairs"
+                  << "; point entries " << double(sum.vp_entries) * invd << " ("
+                  << double(sum.vp_unique) * invd << " after de-duplication), culling implicit\n";
+    if (gCulling && !isSplatting(gAccel))
+        std::cout << "         culling: mean deposits/frame " << double(deposits) * invd
+                  << ", culled " << (deposits > 0 ? 100.0 * (1.0 - double(photons) / double(deposits)) : 0.0)
+                  << "%\n";
+    if (bytes > 0.0)
+        std::cout << "         structure: mean " << bytes * invd / (1024.0 * 1024.0) << " MiB"
+                  << (entries > 0.0 ? ", mean entries " : "")
+                  << (entries > 0.0 ? std::to_string(entries * invd) : std::string())
+                  << "\n";
+    if (levelMax >= 0)
+        std::cout << "         levels: mean " << levels * invd << " in use, levels "
+                  << levelMin << ".." << levelMax << "\n";
+    if (p.stats) {
+        // Means of the per-frame mean, 95th percentile and maximum.
+        double tm = 0, tp = 0, tx = 0, am = 0, ap = 0, ax = 0, cm = 0, cp = 0, cx = 0;
+        for (int i = skip; i < n; ++i) {
+            tm += timings[i].tested.mean;
+            tp += timings[i].tested.p95;
+            tx += timings[i].tested.max;
+            am += timings[i].accepted.mean;
+            ap += timings[i].accepted.p95;
+            ax += timings[i].accepted.max;
+            cm += timings[i].cells_visited.mean;
+            cp += timings[i].cells_visited.p95;
+            cx += timings[i].cells_visited.max;
+        }
+        std::cout << "         per lookup (mean / p95 / max): tested " << tm * invd << " / "
+                  << tp * invd << " / " << tx * invd << ", accepted " << am * invd << " / "
+                  << ap * invd << " / " << ax * invd << ", cells " << cm * invd << " / "
+                  << cp * invd << " / " << cx * invd << "\n";
+    }
+    if (p.radius_mode == RADIUS_FOOTPRINT || p.stats)
+        std::cout << "         radius: mean r " << rMean * invd << ", mean max r "
+                  << rMax * invd << ", mean radius " << rPx * invd
+                  << " pixels\n";
+    if (isStochasticHashGrid(gAccel))
+        std::cout << "         (build = clearing the table; photons are filed during the trace)\n";
+    if (args.verifyGather && !estimatesOnly(gAccel))
         std::cout << "         (query pass not timed: --verify-gather runs it twice)\n";
+    const std::string queryKernel = std::string("query_") + accelName(gAccel) + (p.stats ? "_stats" : "");
+    for (const KernelResources& k : kernelResources())
+        if (queryKernel == k.name)
+            std::cout << "         query kernel " << k.name << ": " << k.registers
+                      << " registers, " << k.local_bytes << " bytes of local memory per thread\n";
+    std::cout << "         " << gEnv.buildType << " build, OptiX validation "
+              << (gEnv.validation ? "on" : "off") << ", " << gEnv.gpu << ", driver "
+              << gEnv.driver << "\n";
 }
 
 // The same numbers as JSON, one record per frame, for whatever plots the
@@ -1814,7 +2714,33 @@ static void writeTimingJson(const std::string& path,
     out.precision(6);
     out << std::fixed;
     out << "{\n";
+    out << "  \"config\": " << jsonString(configName(gAccel, gCulling, p.radius_mode)) << ",\n";
+    out << "  \"family\": \"" << familyName(gAccel, gCulling) << "\",\n";
     out << "  \"accel\": \"" << accelName(gAccel) << "\",\n";
+    out << "  \"environment\": {\"build_type\": " << jsonString(gEnv.buildType)
+        << ", \"validation\": " << (gEnv.validation ? "true" : "false")
+        << ", \"gpu\": " << jsonString(gEnv.gpu)
+        << ", \"driver\": " << jsonString(gEnv.driver)
+        << ", \"cuda_driver_api\": " << gEnv.cudaDriverApi
+        << ", \"cuda_runtime\": " << gEnv.cudaRuntime
+        << ", \"optix\": " << OPTIX_VERSION << "},\n";
+    // Registers and local memory per thread of the CUDA kernels; the OptiX
+    // programs' only show up in a profiler (Nsight Compute).
+    out << "  \"kernels\": {";
+    {
+        const std::vector<KernelResources> ks = kernelResources();
+        for (size_t i = 0; i < ks.size(); ++i)
+            out << (i ? ", " : "") << "\"" << ks[i].name << "\": {\"registers\": " << ks[i].registers
+                << ", \"local_bytes\": " << ks[i].local_bytes << "}";
+    }
+    out << "},\n";
+    out << "  \"table_load\": " << p.table_load << ",\n";
+    out << "  \"inline_positions\": " << (p.inline_positions ? "true" : "false") << ",\n";
+    out << "  \"hier_mask\": " << (p.hier_mask ? "true" : "false") << ",\n";
+    out << "  \"fused\": " << (gFused ? "true" : "false") << ",\n";
+    if (isSplatting(gAccel))
+        out << "  \"splat_cell_factor\": " << p.splat_cell_factor << ",\n"
+            << "  \"splat_stripes\": " << p.splat_stripes << ",\n";
     out << "  \"width\": " << p.width << ",\n";
     out << "  \"height\": " << p.height << ",\n";
     out << "  \"frames\": " << p.offline_frames << ",\n";
@@ -1822,18 +2748,49 @@ static void writeTimingJson(const std::string& path,
     out << "  \"max_depth\": " << p.max_depth << ",\n";
     out << "  \"photon_paths\": " << p.num_photon_paths << ",\n";
     out << "  \"seed\": " << p.seed << ",\n";
+    // Splatting culls implicitly: a photon that reaches no visible point adds nothing.
+    out << "  \"culling\": " << (isSplatting(gAccel) ? "\"implicit\"" : (gCulling ? "true" : "false")) << ",\n";
+    out << "  \"mask_bits\": " << p.cull_mask_bits << ",\n";
+    out << "  \"radius_mode\": \"" << (p.radius_mode == RADIUS_FOOTPRINT ? "footprint" : "global") << "\",\n";
+    out << "  \"k_pix\": " << p.k_pix << ",\n";
+    out << "  \"s0\": " << p.level_s0 << ",\n";
     out << "  \"per_frame\": [\n";
     for (size_t i = 0; i < timings.size(); ++i) {
         const FrameTimings& t = timings[i];
         out << "    {\"frame\": " << i
             << ", \"radius\": " << t.radius
             << ", \"photons\": " << t.photons
+            << ", \"deposits\": " << t.deposits
+            << ", \"culled\": " << t.culled
+            << ", \"r_max\": " << t.r_max
+            << ", \"r_mean\": " << t.r_mean
+            << ", \"r_px_mean\": " << t.r_px_mean
+            << ", \"num_levels\": " << t.num_levels
+            << ", \"level_min\": " << t.level_min
+            << ", \"level_max\": " << t.level_max
+            << ", \"entries\": " << t.entries
+            << ", \"bytes\": " << t.bytes;
+        if (p.stats)
+            out << ", \"tested_mean\": " << t.tested.mean << ", \"tested_p95\": " << t.tested.p95
+                << ", \"tested_max\": " << t.tested.max
+                << ", \"accepted_mean\": " << t.accepted.mean << ", \"accepted_p95\": " << t.accepted.p95
+                << ", \"accepted_max\": " << t.accepted.max
+                << ", \"cells_mean\": " << t.cells_visited.mean << ", \"cells_p95\": " << t.cells_visited.p95
+                << ", \"cells_max\": " << t.cells_visited.max;
+        out
             << ", \"cells\": " << t.cells
             << ", \"buckets\": " << t.buckets
             << ", \"photon_trace_ms\": " << t.photon_trace
             << ", \"build_ms\": " << t.build
             << ", \"camera_ms\": " << t.camera
+            << ", \"mark_ms\": " << t.mark
             << ", \"query_ms\": " << t.query
+            << ", \"finalize_ms\": " << t.finalize
+            << ", \"fused_ms\": " << t.fused
+            << ", \"vp_entries\": " << t.vp_entries
+            << ", \"vp_unique\": " << t.vp_unique
+            << ", \"reached\": " << t.reached
+            << ", \"pairs\": " << t.pairs
             << ", \"accum_ms\": " << t.accum << "}"
             << (i + 1 < timings.size() ? ",\n" : "\n");
     }
@@ -1848,6 +2805,9 @@ struct GatherVerification {
     int differing_pixels = 0; // pixels past the tolerance below
     bool ok = true;
 };
+
+static GatherVerification compareRadiance(const std::vector<float3>& ref,
+    const std::vector<float3>& test);
 
 // Runs the query pass twice over the same photon map and the same gather
 // points — once through the selected structure (uniform grid or hash grid),
@@ -1881,10 +2841,48 @@ static GatherVerification verifyQueryPass(RendererState& state, Params& p,
     CUDA_CHECK(cudaMemcpy(grid.data(), p.query_radiance,
         pixels * sizeof(float3), cudaMemcpyDeviceToHost));
 
+    return compareRadiance(brute, grid);
+}
+
+// --verify-gather for splatting: the frame again as an exact gather over the
+// same gather points and the same photon paths — the photons stored this time
+// — through the matching structure (hash for splat, mlhash for mlsplat), and
+// the two images compared.  Both find the same (photon, visible point) pairs
+// and add the same products, so only the order of the sums tells them apart.
+// Leaves query_radiance holding the splatting result.
+static GatherVerification verifySplatFrame(RendererState& state, Params& p, CUstream& stream,
+    std::vector<float3>& splat, std::vector<float3>& gather)
+{
+    const size_t pixels = size_t(p.width) * size_t(p.height);
+    splat.resize(pixels);
+    gather.resize(pixels);
+    CUDA_CHECK(cudaMemcpy(splat.data(), p.query_radiance, pixels * sizeof(float3),
+        cudaMemcpyDeviceToHost));
+
+    const AccelType splatAccel = gAccel;
+    gAccel = (splatAccel == ACCEL_MLSPLAT) ? ACCEL_MLHASH : ACCEL_HASH_GRID;
+    p.culling = 0;
+    launchPhotonTracing(state, p, stream, nullptr);
+    launchQueryPass(state, p, stream);
+    CUDA_CHECK(cudaMemcpy(gather.data(), p.query_radiance, pixels * sizeof(float3),
+        cudaMemcpyDeviceToHost));
+    gAccel = splatAccel;
+    p.accel = splatAccel;
+
+    CUDA_CHECK(cudaMemcpy(p.query_radiance, splat.data(), pixels * sizeof(float3),
+        cudaMemcpyHostToDevice));
+    return compareRadiance(gather, splat);
+}
+
+// How far `test` is from `ref`, pixel by pixel.
+static GatherVerification compareRadiance(const std::vector<float3>& ref,
+    const std::vector<float3>& test)
+{
+    const size_t pixels = std::min(ref.size(), test.size());
     GatherVerification v;
     for (size_t i = 0; i < pixels; ++i) {
-        const float a[3] = { brute[i].x, brute[i].y, brute[i].z };
-        const float b[3] = { grid[i].x, grid[i].y, grid[i].z };
+        const float a[3] = { ref[i].x, ref[i].y, ref[i].z };
+        const float b[3] = { test[i].x, test[i].y, test[i].z };
         bool bad = false;
         for (int c = 0; c < 3; ++c) {
             const double diff = std::fabs((double)a[c] - (double)b[c]);
@@ -1906,6 +2904,32 @@ static GatherVerification verifyQueryPass(RendererState& state, Params& p,
     }
     v.ok = (v.differing_pixels == 0);
     return v;
+}
+
+// Per-pixel images of the last frame's lookups, all three channels the same
+// value: the radius in pixel footprints, r / (t * pixel_angle), which in
+// footprint mode is radius_scale * k_pix wherever the clamp did not engage,
+// and the cell level.  -1 where the pixel has no lookup.  Gather points are
+// per-pixel, not photon data, and this is one readback at the end of a run.
+static void writeGatherDebugImages(const std::string& prefix, const Params& p,
+    int W, int H)
+{
+    std::vector<GatherPoint> gps(size_t(W) * size_t(H));
+    CUDA_CHECK(cudaMemcpy(gps.data(), p.gather_points, gps.size() * sizeof(GatherPoint),
+        cudaMemcpyDeviceToHost));
+    std::vector<float3> rpx(gps.size()), level(gps.size());
+    for (size_t i = 0; i < gps.size(); ++i) {
+        const GatherPoint& g = gps[i];
+        const float w = g.t * p.pixel_angle;
+        const float v = (g.valid && w > 0.f) ? g.r / w : -1.f;
+        const float l = g.valid ? float(g.level) : -1.f;
+        rpx[i] = make_float3(v, v, v);
+        level[i] = make_float3(l, l, l);
+    }
+    saveEXR(prefix + ".rpx.exr", rpx, W, H, true);
+    saveEXR(prefix + ".level.exr", level, W, H, true);
+    std::cout << "[Debug] " << prefix << ".rpx.exr and .level.exr, last frame: k_pix "
+              << p.k_pix << ", radius scale " << p.radius_scale << "\n";
 }
 
 static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
@@ -1935,11 +2959,38 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
             size_t(W) * H * sizeof(float3)));
         p.gather_points = reinterpret_cast<GatherPoint*>(state.dGatherPoints);
         p.query_radiance = reinterpret_cast<float3*>(state.dQueryRadiance);
+
+        // --stats: one counter of each kind per pixel, written by the query
+        // pass and summarised on the device after it is timed.
+        // With splatting they are counted per deposit instead, at most one
+        // per bounce of every path.
+        if (args.stats) {
+            const size_t perPixel = size_t(W) * H;
+            const size_t perDeposit = std::min<size_t>(size_t(p.num_photon_paths) * p.max_depth, kMaxPhotonSlots);
+            const size_t slots = isSplatting(gAccel) ? perDeposit : perPixel;
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.stat_tested), slots * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.stat_accepted), slots * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.stat_cells), perPixel * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.stat_slot), sizeof(int)));
+            p.stat_capacity = (int)slots;
+            p.stats = 1;
+        }
+
+        // Splatting's accumulators: K copies of a float3 per visible point.
+        if (isSplatting(gAccel)) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.splat_acc),
+                size_t(p.splat_stripes) * W * H * 3 * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.splat_counts), 3 * sizeof(unsigned long long)));
+        }
     }
 
     p.frame_buffer = dFrame;
     p.accum_buffer = reinterpret_cast<float3*>(dAccum);
-    p.frame_index  = 0;
+    // Frame i is the same frame in every run — the same photons, gather points
+    // and radius, all seeded by (index, frame, seed) — so starting at
+    // --first-frame N renders exactly frames N.. of a longer run.  The image
+    // is the average of the frames rendered.
+    p.frame_index = args.firstFrame;
 
     // Print the schedule up front.  The last frame's radius is not the blur you
     // get: the frames are averaged with equal weight, so what the image behaves
@@ -1964,57 +3015,282 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
     std::vector<FrameTimings> timings;
     timings.reserve(p.offline_frames);
 
+    // Error against time (--checkpoints, --dump-frames).  Both happen between
+    // frames, after everything of the frame has been timed, so neither the
+    // file writes nor the --stats summaries are in the recorded time, which
+    // is the sum of the frames' GPU pass timers.
+    std::vector<int> checkpoints = args.checkpoints;
+    if (args.checkpointsPow2)
+        for (int n = 1; n <= p.offline_frames; n *= 2)
+            checkpoints.push_back(n);
+    std::sort(checkpoints.begin(), checkpoints.end());
+    checkpoints.erase(std::unique(checkpoints.begin(), checkpoints.end()), checkpoints.end());
+    const bool isExr = outputFile.size() > 4 && outputFile.compare(outputFile.size() - 4, 4, ".exr") == 0;
+    const std::string stem = isExr ? outputFile.substr(0, outputFile.size() - 4) : outputFile;
+    const int cpDigits = (int)std::to_string(std::max(p.offline_frames, 1)).size();
+    struct CheckpointRecord {
+        int frames;
+        int frameIndex;
+        double gpuMs;
+        std::string file;
+    };
+    std::vector<CheckpointRecord> cpRecords;
+    double gpuMs = 0.0;
+    if (!checkpoints.empty() && p.render_mode == 2)
+        std::cerr << "[Checkpoints] not in photon-tracing-only mode; ignored\n";
+    if (!args.dumpFrames.empty() && p.render_mode != 1)
+        std::cerr << "[Dump] single frames only in photon mapping mode; ignored\n";
+
+    auto writeCheckpoints = [&]() {
+        std::ofstream out(stem + ".checkpoints.json");
+        out.precision(6);
+        out << std::fixed << "{\n  \"output\": " << jsonString(outputFile)
+            << ",\n  \"mode\": \"" << (p.render_mode == 0 ? "pt" : "pm") << "\""
+            << ",\n  \"config\": "
+            << jsonString(p.render_mode == 0 ? std::string("pt") : configName(gAccel, gCulling, p.radius_mode))
+            << ",\n  \"seed\": " << p.seed << ",\n  \"first_frame\": " << args.firstFrame
+            << ",\n  \"frames\": " << p.offline_frames << ",\n  \"checkpoints\": [\n";
+        for (size_t i = 0; i < cpRecords.size(); ++i)
+            out << "    {\"frames\": " << cpRecords[i].frames << ", \"frame_index\": "
+                << cpRecords[i].frameIndex << ", \"gpu_ms\": " << cpRecords[i].gpuMs
+                << ", \"file\": " << jsonString(cpRecords[i].file) << "}"
+                << (i + 1 < cpRecords.size() ? ",\n" : "\n");
+        out << "  ]\n}\n";
+    };
+
     // --verify-gather replaces the timed query pass with two untimed ones, so a
     // run either measures or checks — never both.
     const bool verifyGather = args.verifyGather && p.render_mode == 1
-        && gAccel != ACCEL_BRUTE_FORCE;
+        && gAccel != ACCEL_BRUTE_FORCE && !estimatesOnly(gAccel);
     if (args.verifyGather && gAccel == ACCEL_BRUTE_FORCE)
         std::cerr << "[Verify] --accel brute builds no structure; nothing to compare against\n";
+    if (args.verifyGather && estimatesOnly(gAccel))
+        std::cerr << "[Verify] the " << accelLabel(gAccel) << " keeps one photon per "
+                     "bucket, so it estimates the brute-force answer rather than "
+                     "reproducing it; there is nothing to compare pixel by pixel\n";
     std::vector<float3> verifyBrute, verifyGrid;
     int verifyFailures = 0;
+    FusedHistory fusedHist;
+    if (gFused) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.fused_max_r), sizeof(unsigned int)));
+        p.fused_store_points = verifyGather ? 1 : 0;
+    }
+
+    // --verify-culling traces every frame three times over the same gather
+    // points — the full map twice, then the culled map — and runs the same
+    // lookup over each.  The two full maps differ only in the order in which
+    // the photons were deposited (slots come from an atomic), so their
+    // difference is the float-summation floor, and the culled map is held to
+    // that: exact culling changes which photons are stored, never which ones
+    // lie within r, and a dropped photon would show up as a difference of
+    // order 1/(photons per lookup), orders of magnitude above the floor.
+    // Untimed, like --verify-gather.
+    const bool verifyCulling = args.verifyCulling && p.render_mode == 1
+        && !estimatesOnly(gAccel) && !isSplatting(gAccel) && !gFused;
+    if (args.verifyCulling && estimatesOnly(gAccel))
+        std::cerr << "[Verify] the " << accelLabel(gAccel) << " keeps one photon per "
+                     "bucket, and culling changes which photons compete for a "
+                     "bucket; compare averages over many frames instead\n";
+    if (args.verifyCulling && (isSplatting(gAccel) || gFused))
+        std::cerr << "[Verify] --verify-culling is for the gathers with a culled map;"
+                     " splatting culls implicitly and --fused runs without culling\n";
+    std::vector<float3> cullFull, cullFull2, cullTest;
+    int cullFailures = 0;
+    double cullWorst = 0.0, cullFloorWorst = 0.0;
 
     for (int f = 0; f < p.offline_frames; ++f) {
 
         if (p.render_mode == 0) {
             // Path Tracing launch
-            launchPathTracing(state, p, stream);
+            gpuMs += launchPathTracing(state, p, stream);
         } else if (p.render_mode == 1) {
-            // Probabilistic PPM: shrink the radius for this frame *before* the
-            // map is traced, because the grid is binned at gather_radius.
+            // Probabilistic PPM: shrink the radius for this frame *before*
+            // anything uses it, because the grid is binned at gather_radius.
             updatePPMRadius(p);
 
             FrameTimings ft;
+            // Splatting culls implicitly — a deposit that reaches no visible
+            // point adds nothing — so it has no mask.
+            p.culling = (!isSplatting(gAccel) && (gCulling || verifyCulling)) ? 1 : 0;
 
-            // Pass 1 — Photon tracing, then the grid build.  A fresh map every
-            // frame: reusing one map would make every frame share the same
-            // density-estimate error, so the blotches would stay put no matter
-            // how long it ran.  It is also what makes the frames independent
-            // estimates, which is the assumption the PPM radius schedule is
-            // derived under.
-            launchPhotonTracing(state, p, stream, &ft);
+            // Pass 1 — the camera walk, parking every pixel at its first
+            // diffuse vertex.  It goes first so that the photon pass and the
+            // build can be told what this frame's lookups are going to need
+            // (with culling: which cells they search).  Nothing in it reads
+            // the photon map, and every pass draws from its own random stream,
+            // so moving it ahead of the photons changes no random number and
+            // no pixel.
+            // --fused: after the first frame, the structure first and then the
+            // camera walk and lookup in one pass.
+            const bool fusedFrame = gFused && fusedHist.valid;
+            if (fusedFrame)
+                launchFusedFrame(state, p, stream, &ft, fusedHist);
+            else
+                ft.camera = launchCameraPass(state, p, stream, &ft);
 
-            // Pass 2 — the camera walk, and then the photon lookup it parked.
-            ft.camera = launchCameraPass(state, p, stream);
-
-            if (verifyGather) {
-                const GatherVerification v = verifyQueryPass(state, p, stream,
-                    verifyBrute, verifyGrid);
-                if (!v.ok)
-                    ++verifyFailures;
-                std::cout << "\r[Verify] frame " << f
-                          << (v.ok ? "  OK  " : "  FAIL")
-                          << "  " << accelName(gAccel) << " vs brute: max abs diff = " << v.max_abs
-                          << "  max rel = " << v.max_rel
-                          << "  pixels off = " << v.differing_pixels << "\n";
+            if (fusedFrame) {
+                if (verifyGather) {
+                    // The fused frame stored its gather points; the lookup
+                    // again over them, brute force, must agree.
+                    const size_t pixels = size_t(W) * size_t(H);
+                    verifyGrid.resize(pixels);
+                    CUDA_CHECK(cudaMemcpy(verifyGrid.data(), p.query_radiance,
+                        pixels * sizeof(float3), cudaMemcpyDeviceToHost));
+                    const int built = p.accel;
+                    p.accel = ACCEL_BRUTE_FORCE;
+                    launchQueryPass(state, p, stream);
+                    verifyBrute.resize(pixels);
+                    CUDA_CHECK(cudaMemcpy(verifyBrute.data(), p.query_radiance,
+                        pixels * sizeof(float3), cudaMemcpyDeviceToHost));
+                    p.accel = built;
+                    CUDA_CHECK(cudaMemcpy(p.query_radiance, verifyGrid.data(),
+                        pixels * sizeof(float3), cudaMemcpyHostToDevice));
+                    const GatherVerification v = compareRadiance(verifyBrute, verifyGrid);
+                    if (!v.ok)
+                        ++verifyFailures;
+                    std::cout << "\r[Verify] frame " << f << (v.ok ? "  OK  " : "  FAIL")
+                              << "  fused-" << accelName(gAccel) << " vs brute: max abs diff = "
+                              << v.max_abs << "  max rel = " << v.max_rel
+                              << "  pixels off = " << v.differing_pixels << "\n";
+                }
+            } else if (isSplatting(gAccel)) {
+                // Family C: the visible points into their grid, the photons
+                // splatted into them as they are deposited, the flux into
+                // radiance.
+                launchSplatPasses(state, p, stream, &ft);
+                if (verifyGather) {
+                    const GatherVerification v = verifySplatFrame(state, p, stream,
+                        verifyGrid, verifyBrute);
+                    if (!v.ok)
+                        ++verifyFailures;
+                    std::cout << "\r[Verify] frame " << f
+                              << (v.ok ? "  OK  " : "  FAIL")
+                              << "  " << accelName(gAccel) << " vs "
+                              << (gAccel == ACCEL_MLSPLAT ? "mlhash" : "hash")
+                              << ": max abs diff = " << v.max_abs
+                              << "  max rel = " << v.max_rel
+                              << "  pixels off = " << v.differing_pixels << "\n";
+                }
             } else {
-                ft.query = launchQueryPass(state, p, stream);
+                // With culling, the cells those lookups will search are marked
+                // next, from the gather points just written.
+                if (p.culling)
+                    ft.mark = launchMarkPass(state, p, stream);
+
+                if (verifyCulling) {
+                    const size_t pixels = size_t(W) * size_t(H);
+                    cullFull.resize(pixels);
+                    cullFull2.resize(pixels);
+                    p.culling = 0;
+                    for (std::vector<float3>* ref : { &cullFull, &cullFull2 }) {
+                        launchPhotonTracing(state, p, stream);
+                        launchQueryPass(state, p, stream);
+                        CUDA_CHECK(cudaMemcpy(ref->data(), p.query_radiance,
+                            pixels * sizeof(float3), cudaMemcpyDeviceToHost));
+                    }
+                    p.culling = 1;
+                }
+
+                // Pass 2 — Photon tracing, then the grid build.  A fresh map every
+                // frame: reusing one map would make every frame share the same
+                // density-estimate error, so the blotches would stay put no matter
+                // how long it ran.  It is also what makes the frames independent
+                // estimates, which is the assumption the PPM radius schedule is
+                // derived under.
+                launchPhotonTracing(state, p, stream, &ft);
+
+                // Pass 3 — the photon lookup the camera pass parked.
+                if (verifyGather) {
+                    const GatherVerification v = verifyQueryPass(state, p, stream,
+                        verifyBrute, verifyGrid);
+                    if (!v.ok)
+                        ++verifyFailures;
+                    std::cout << "\r[Verify] frame " << f
+                              << (v.ok ? "  OK  " : "  FAIL")
+                              << "  " << accelName(gAccel) << " vs brute: max abs diff = " << v.max_abs
+                              << "  max rel = " << v.max_rel
+                              << "  pixels off = " << v.differing_pixels << "\n";
+                } else {
+                    ft.query = launchQueryPass(state, p, stream);
+                }
+
+                if (verifyCulling) {
+                    cullTest.resize(cullFull.size());
+                    CUDA_CHECK(cudaMemcpy(cullTest.data(), p.query_radiance,
+                        cullTest.size() * sizeof(float3), cudaMemcpyDeviceToHost));
+                    const GatherVerification v = compareRadiance(cullFull, cullTest);
+                    const GatherVerification floor = compareRadiance(cullFull, cullFull2);
+                    // At the floor: within 1e-5, or no further than twice what two
+                    // full maps of the same frame are from each other.
+                    const bool ok = v.ok
+                        && v.max_rel <= std::max(1e-5, 2.0 * floor.max_rel);
+                    if (!ok)
+                        ++cullFailures;
+                    cullWorst = std::max(cullWorst, v.max_rel);
+                    cullFloorWorst = std::max(cullFloorWorst, floor.max_rel);
+                    std::cout << "\r[Verify] frame " << f << (ok ? "  OK  " : "  FAIL")
+                              << "  " << accelName(gAccel) << " culled vs full: max abs = "
+                              << v.max_abs << "  max rel = " << v.max_rel
+                              << "  | full vs full: max rel = " << floor.max_rel
+                              << "  | culled " << 100.0 * ft.culled << "% of "
+                              << ft.deposits << " deposits, levels " << p.num_levels << "\n";
+                }
+            }
+
+            // The first frame of a fused run is a normal one: it gives the next
+            // its radius and levels.
+            if (gFused && !fusedFrame)
+                rememberForFused(p, fusedHist);
+
+            if (p.stats && isSplatting(gAccel)) {
+                // per deposit: visible-point entries tested, pairs made
+                int deposits = 0;
+                CUDA_CHECK(cudaMemcpy(&deposits, p.stat_slot, sizeof(int), cudaMemcpyDeviceToHost));
+                deposits = std::min(deposits, p.stat_capacity);
+                summarizeQueryStats(p.stat_tested, deposits, state.grid, stream, ft.tested);
+                summarizeQueryStats(p.stat_accepted, deposits, state.grid, stream, ft.accepted);
+            } else if (p.stats) {
+                summarizeQueryStats(p.stat_tested, W * H, state.grid, stream, ft.tested);
+                summarizeQueryStats(p.stat_accepted, W * H, state.grid, stream, ft.accepted);
+                summarizeQueryStats(p.stat_cells, W * H, state.grid, stream, ft.cells_visited);
             }
 
             ft.accum = launchAccumulatePass(p, stream);
             timings.push_back(ft);
+            gpuMs += ft.total();
+
+            // This frame's own radiance, before the next frame overwrites it.
+            if (std::binary_search(args.dumpFrames.begin(), args.dumpFrames.end(), f + 1)) {
+                std::vector<float3> img(size_t(W) * H);
+                CUDA_CHECK(cudaMemcpy(img.data(), p.query_radiance, img.size() * sizeof(float3),
+                    cudaMemcpyDeviceToHost));
+                saveEXR(stem + ".frame" + std::to_string(p.frame_index) + ".exr", img, W, H,
+                    args.floatExr);
+            }
         } else if (p.render_mode == 2) {
+            // Nothing marks cells without a camera pass, so nothing is culled.
+            p.culling = 0;
             launchPhotonTracing(state, p, stream);
             launchLightVis(state, p, stream, dLightvisBuf);
+        }
+
+        // The image accumulated so far, and the GPU time it took.
+        if (p.render_mode != 2 && std::binary_search(checkpoints.begin(), checkpoints.end(), f + 1)) {
+            std::vector<float3> img(size_t(W) * H);
+            CUDA_CHECK(cudaMemcpy(img.data(), dAccum, img.size() * sizeof(float3),
+                cudaMemcpyDeviceToHost));
+            const float inv = 1.f / float(f + 1);
+            for (auto& c : img) {
+                c.x = std::isfinite(c.x) ? c.x * inv : 0.f;
+                c.y = std::isfinite(c.y) ? c.y * inv : 0.f;
+                c.z = std::isfinite(c.z) ? c.z * inv : 0.f;
+            }
+            std::string n = std::to_string(f + 1);
+            n.insert(0, size_t(std::max(0, cpDigits - (int)n.size())), '0');
+            const std::string file = stem + ".cp" + n + ".exr";
+            saveEXR(file, img, W, H, args.floatExr);
+            cpRecords.push_back({ f + 1, p.frame_index, gpuMs, file });
+            writeCheckpoints();
         }
 
         p.frame_index++;
@@ -2026,10 +3302,49 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
 
     reportTimings(timings, args, p);
     writeTimingJson(args.timingJson, timings, args, p);
+    if (!args.debugExr.empty() && p.render_mode == 1)
+        writeGatherDebugImages(args.debugExr, p, W, H);
+    if (!args.debugExr.empty() && p.stats) {
+        // Photons accepted by each lookup of the last frame (-1: no lookup).
+        std::vector<int> accepted(size_t(W) * H);
+        CUDA_CHECK(cudaMemcpy(accepted.data(), p.stat_accepted, accepted.size() * sizeof(int),
+            cudaMemcpyDeviceToHost));
+        std::vector<float3> img(accepted.size());
+        for (size_t i = 0; i < accepted.size(); ++i)
+            img[i] = make_float3(float(accepted[i]), float(accepted[i]), float(accepted[i]));
+        saveEXR(args.debugExr + ".accepted.exr", img, W, H, true);
+    }
+    if (p.stats) {
+        CUDA_CHECK(cudaFree(p.stat_tested));
+        CUDA_CHECK(cudaFree(p.stat_accepted));
+        CUDA_CHECK(cudaFree(p.stat_cells));
+        CUDA_CHECK(cudaFree(p.stat_slot));
+        p.stat_tested = p.stat_accepted = p.stat_cells = p.stat_slot = nullptr;
+        p.stats = 0;
+    }
+    if (p.splat_acc) {
+        CUDA_CHECK(cudaFree(p.splat_acc));
+        CUDA_CHECK(cudaFree(p.splat_counts));
+        p.splat_acc = nullptr;
+        p.splat_counts = nullptr;
+    }
+    if (p.fused_max_r) {
+        CUDA_CHECK(cudaFree(p.fused_max_r));
+        p.fused_max_r = nullptr;
+    }
     if (verifyGather) {
         std::cout << "[Verify] " << (verifyFailures == 0 ? "PASS" : "FAIL")
                   << " — " << (p.offline_frames - verifyFailures) << "/"
-                  << p.offline_frames << " frames matched brute force\n";
+                  << p.offline_frames << " frames matched "
+                  << (isSplatting(gAccel) ? (gAccel == ACCEL_MLSPLAT ? "the mlhash gather" : "the hash gather")
+                                          : "brute force") << "\n";
+    }
+    if (verifyCulling) {
+        std::cout << "[Verify] culling " << (cullFailures == 0 ? "PASS" : "FAIL")
+                  << " — " << (p.offline_frames - cullFailures) << "/"
+                  << p.offline_frames << " frames matched the full map"
+                  << "  (worst max rel " << cullWorst << ", full-vs-full floor "
+                  << cullFloorWorst << ")\n";
     }
 
     std::vector<float3> hostAccum(W * H);
@@ -2061,7 +3376,7 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
         if (!std::isfinite(c.z)) c.z = 0.f;
     }
 
-    bool ok = saveEXR(outputFile, hostAccum, W, H);
+    bool ok = saveEXR(outputFile, hostAccum, W, H, args.floatExr);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUDA_CHECK(cudaFree(dFrame));
@@ -2077,7 +3392,7 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
 
     // A failed comparison is a failed run: the image is there, but it was not
     // produced by a lookup anyone should trust.
-    return ok && verifyFailures == 0;
+    return ok && verifyFailures == 0 && cullFailures == 0;
 }
 
 bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p) {
@@ -2132,6 +3447,10 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
         size_t(W) * H * sizeof(float3)));
     p.gather_points = reinterpret_cast<GatherPoint*>(state.dGatherPoints);
     p.query_radiance = reinterpret_cast<float3*>(state.dQueryRadiance);
+    // ... and splatting's accumulators, the structure being a dropdown too.
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.splat_acc),
+        size_t(p.splat_stripes) * W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p.splat_counts), 3 * sizeof(unsigned long long)));
 
     p.frame_index = 0;
 
@@ -2141,6 +3460,7 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     bool photons_valid = false;
     bool retracePhotons = true; // a fresh map per frame is what makes it converge
     int lastDeposits = 0;
+    FrameTimings lastFrame; // statistics of the last photon pass, for the GUI
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -2252,12 +3572,31 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
                     100.f * p.gather_radius / std::max(p.ppm_radius_initial, 1e-9f));
             }
 
+            // Per-pixel radius: k_pix pixel footprints at the end of the camera
+            // path, shrunk by the same schedule.  Global keeps one radius per
+            // frame, the slider above.
+            const char* radiusModes[] = { "Global", "Footprint (per pixel)" };
+            int radiusMode = p.radius_mode;
+            if (ImGui::Combo("Radius", &radiusMode, radiusModes, IM_ARRAYSIZE(radiusModes))) {
+                p.radius_mode = radiusMode;
+                if (p.radius_mode == RADIUS_FOOTPRINT)
+                    p.adaptive_radius = 0; // the two do not compose
+                resetAccum = true;
+                resetPhotons = true; // the grid is binned at the largest radius
+            }
+            if (p.radius_mode == RADIUS_FOOTPRINT
+                && ImGui::SliderFloat("k_pix", &p.k_pix, 0.5f, 32.f, "%.2f pixels")) {
+                resetAccum = true;
+                resetPhotons = true;
+            }
+
             bool adaptive = p.adaptive_radius != 0;
-            if (!p.use_ppm && ImGui::Checkbox("Adaptive radius", &adaptive)) {
+            if (!p.use_ppm && p.radius_mode == RADIUS_GLOBAL
+                && ImGui::Checkbox("Adaptive radius", &adaptive)) {
                 p.adaptive_radius = adaptive ? 1 : 0;
                 resetAccum = true;
             }
-            if (!p.use_ppm && adaptive) {
+            if (!p.use_ppm && p.radius_mode == RADIUS_GLOBAL && adaptive) {
                 if (ImGui::SliderInt("Target photons", &p.target_photons, 8, 512))
                     resetAccum = true;
             }
@@ -2281,21 +3620,57 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
                 resetPhotons = true;
             }
 
-            ImGui::Checkbox("Retrace every frame", &retracePhotons);
+            // Turning it off freezes the map the next frame traces, so that
+            // one must not be culled: a map culled for one frame's lookups is
+            // missing photons the next frame's lookups need.
+            if (ImGui::Checkbox("Retrace every frame", &retracePhotons) && gCulling)
+                resetPhotons = true;
             ImGui::SameLine();
-            ImGui::TextDisabled("(off = noise stops converging)");
+            ImGui::TextDisabled(p.radius_mode == RADIUS_FOOTPRINT
+                    ? "(always on with a per-pixel radius)"
+                    : "(off = noise stops converging)");
 
-            // Switching the structure must not change the image: the same
-            // photons pass the same tests, only the set of photons *looked at*
-            // differs.  Brute force is the reference that tests every photon.
-            const char* accelItems[] = { "Brute force", "Uniform grid", "Hash grid" };
+            bool culling = gCulling;
+            if (ImGui::Checkbox("Photon culling", &culling)) {
+                gCulling = culling;
+                resetAccum = true;
+                resetPhotons = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(store only photons a lookup can reach)");
+            if (gCulling && !retracePhotons && p.radius_mode == RADIUS_GLOBAL)
+                ImGui::TextDisabled("  off while Retrace every frame is off");
+            else if (gCulling && p.render_mode != 1)
+                ImGui::TextDisabled("  photon mapping only");
+            else if (gCulling)
+                ImGui::Text("Culled: %.1f%% of %lld deposits", 100.0 * lastFrame.culled,
+                    lastFrame.deposits);
+
+            // Switching between the exact structures must not change the
+            // image: the same photons pass the same tests, only the set of
+            // photons *looked at* differs — splatting included, which finds
+            // the very same pairs from the photon's side.  Brute force is the
+            // reference that tests every photon.  The two stochastic hash
+            // grids are the exception by design — one photon per bucket, so
+            // they add noise (and the non-rectified one a bias); see
+            // insertStochastic.  Listed in AccelType order: the index is the
+            // enum value.
+            const char* accelItems[] = { "Brute force", "Uniform grid", "Hash grid",
+                "Stochastic hash grid", "Rectified stochastic hash grid",
+                "Multi-level hash grid", "Multi-level rectified hash grid",
+                "Splatting (single level)", "Splatting (multi-level)", "Stochastic splatting" };
             int accelIndex = (int)gAccel;
             if (ImGui::Combo("Acceleration structure", &accelIndex, accelItems,
                     IM_ARRAYSIZE(accelItems))) {
                 gAccel = (AccelType)accelIndex;
+                // Splatting fixes the radii before the photons: no adaptive one.
+                if (isSplatting(gAccel))
+                    p.adaptive_radius = 0;
                 resetAccum = true;
                 resetPhotons = true; // the structure is built by the photon pass
             }
+            if (isSplatting(gAccel))
+                ImGui::TextDisabled("  culling implicit: only photons reaching a visible point count");
         }
 
         if (p.render_mode == 2 && ImGui::CollapsingHeader("Photon visualisation", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -2410,29 +3785,65 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             // Path Tracing launch
             launchPathTracing(state, p, stream);
         } else {
-            // Pass 1 — Photon tracing.  Re-traced every frame by default: the
-            // accumulation buffer can only average away photon noise if each
-            // frame sees an *independent* photon map.  Holding one map fixed
-            // (as this used to) freezes its density-estimate error into the
-            // image, which is what left the permanent blotches.
-            if (retracePhotons || !photons_valid) {
-                // Before the trace — the grid is binned at gather_radius.  With
-                // "Retrace every frame" off the map (and so the radius) is
+            // Photons are re-traced every frame by default: the accumulation
+            // buffer can only average away photon noise if each frame sees an
+            // *independent* photon map.  Holding one map fixed (as this used
+            // to) freezes its density-estimate error into the image, which is
+            // what left the permanent blotches.
+            //
+            // A per-pixel radius needs it too: the radii move with the pixel
+            // jitter every frame, and a frozen single-level grid's cells, sized
+            // for the largest radius of the frame it was traced in, need not
+            // cover the next frame's.
+            //
+            // Splatting keeps no map at all: every frame splats a fresh photon
+            // pass into that frame's visible points.
+            if (p.render_mode == 1 && isSplatting(gAccel)) {
+                updatePPMRadius(p);
+                p.culling = 0;
+                launchCameraPass(state, p, stream);
+                launchSplatPasses(state, p, stream, &lastFrame);
+                launchAccumulatePass(p, stream);
+                photons_valid = false;
+            } else {
+                const bool retrace = retracePhotons || p.radius_mode == RADIUS_FOOTPRINT;
+                const bool tracePhotons = retrace || !photons_valid;
+
+                // Before anything else — the grid is binned at gather_radius.
+                // With "Retrace every frame" off the map (and so the radius) is
                 // frozen, which is consistent: a schedule that shrank the radius
                 // over a map that never changes would just re-filter the same
                 // photons and converge to nothing.
-                updatePPMRadius(p);
-                lastDeposits = launchPhotonTracing(state, p, stream);
-                photons_valid = true;
-            }
+                if (tracePhotons)
+                    updatePPMRadius(p);
 
-            // Pass 2 — Gathering, or splatting the map straight onto the film
-            if (p.render_mode == 1) {
-                launchCameraPass(state, p, stream);
-                launchQueryPass(state, p, stream);
-                launchAccumulatePass(p, stream);
-            } else {
-                launchLightVis(state, p, stream, dLightvisBuf);
+                // Culling keeps only what this frame's lookups can reach, so it
+                // needs a camera pass to mark the cells and a map that is not
+                // reused by the frames after this one.
+                p.culling = (gCulling && retrace && p.render_mode == 1) ? 1 : 0;
+
+                // Pass 1 — the camera walk (photon mapping only).  Ahead of the
+                // photons, as in renderOffline, so that the photon pass can be
+                // told what this frame's lookups are going to need.
+                if (p.render_mode == 1)
+                    launchCameraPass(state, p, stream);
+                if (p.culling)
+                    launchMarkPass(state, p, stream);
+
+                // Pass 2 — Photon tracing and the grid build.
+                if (tracePhotons) {
+                    lastDeposits = launchPhotonTracing(state, p, stream, &lastFrame);
+                    photons_valid = true;
+                }
+
+                // Pass 3 — the photon lookup, or splatting the map straight onto
+                // the film
+                if (p.render_mode == 1) {
+                    launchQueryPass(state, p, stream);
+                    launchAccumulatePass(p, stream);
+                } else {
+                    launchLightVis(state, p, stream, dLightvisBuf);
+                }
             }
         }
 
@@ -2462,6 +3873,10 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
     cudaFree(reinterpret_cast<void*>(state.dGatherPoints));
     cudaFree(reinterpret_cast<void*>(state.dQueryRadiance));
     state.dGatherPoints = state.dQueryRadiance = 0;
+    cudaFree(p.splat_acc);
+    cudaFree(p.splat_counts);
+    p.splat_acc = nullptr;
+    p.splat_counts = nullptr;
     freeGridScratch(state.grid);
     cudaGraphicsUnregisterResource(cudaPBO);
 
@@ -2480,9 +3895,22 @@ int main(int argc, char** argv) {
     args = parseArgs(argc, argv);
     // Checked before anything is loaded, so a typo fails in milliseconds
     // rather than after the scene and the pipeline have been built.
+    // The reservoir unit test needs nothing but the GPU.
+    if (args.selftestReservoir)
+        return runReservoirSelfTest(10, 100000) ? 0 : 1;
+    gRectBuckets = args.rectBuckets;
+    gMlrectInTrace = args.mlrectInTrace;
+
     if (!parseAccel(args.accel, gAccel)) {
         std::cerr << "Unknown --accel value: " << args.accel
-                  << " (expected grid, hash or brute)\n";
+                  << " (expected brute, uniform, hash, stochastic, rect, mlhash, mlrect,"
+                     " splat, mlsplat or stochsplat)\n";
+        return 2;
+    }
+    gFused = args.fused;
+    if (gFused && (!args.offline || !args.photon || fusedIndex(gAccel) < 0 || args.culling)) {
+        std::cerr << "--fused is for offline photon mapping in family A: --accel uniform, hash,"
+                     " rect, mlhash or mlrect, without culling\n";
         return 2;
     }
     CameraFileState cam{};
@@ -2509,8 +3937,10 @@ int main(int argc, char** argv) {
     gPitch = cam.pitch;
     rebuildCameraVectors(p);
 
-    createContext(state);
-    std::cout << "Context created.\n";
+    createContext(state, args.validation);
+    gEnv = queryEnvironment(args.validation);
+    std::cout << "Context created (" << gEnv.buildType << " build, OptiX validation "
+              << (args.validation ? "on" : "off") << ").\n";
 
     loadScene(args.sceneFile, scene, state);
     std::cout << "Materials: " << scene.materials.size()
@@ -2538,7 +3968,7 @@ int main(int argc, char** argv) {
     // Gather radius as a fraction of the scene, not an absolute 1.0 — a radius
     // that happens to be hucdge for the scene is exactly what smears the photon
     // estimate into big soft stains.
-    p.gather_radius = 0.03f * p.scene_radius;
+    p.gather_radius = 0.015f * p.scene_radius;
 
     // Probabilistic PPM.  alpha = 2/3 is the MSE-optimal exponent, not a taste
     // knob — see the derivation on Params::use_ppm.
@@ -2607,6 +4037,59 @@ int main(int argc, char** argv) {
     }
     p.gather_radius = p.ppm_radius_initial;
 
+    // Cell levels, shared by culling and the multi-level grids.  Counted from
+    // the scene box minimum; level 0 is 2^-18 of the box diagonal unless --s0
+    // says otherwise, so the 32 levels run from 2^-18 to 2^13 diagonals.
+    {
+        const float dx = p.scene_aabb_max.x - p.scene_aabb_min.x;
+        const float dy = p.scene_aabb_max.y - p.scene_aabb_min.y;
+        const float dz = p.scene_aabb_max.z - p.scene_aabb_min.z;
+        const float diag = std::max(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-6f);
+        p.level_origin = p.scene_aabb_min;
+        p.level_s0 = (args.s0 > 0.f) ? args.s0 : std::ldexp(diag, -18);
+
+        // Per-pixel radius.  The clamp is a safety net for degenerate paths,
+        // not part of the method.
+        p.radius_mode = (args.radiusMode == "footprint") ? RADIUS_FOOTPRINT : RADIUS_GLOBAL;
+        p.k_pix = args.kPix;
+        p.radius_scale = 1.f;
+        p.radius_min = 1e-6f * diag;
+        p.radius_max = 0.25f * diag;
+
+        // The top level must still be at least as wide as any radius a
+        // lookup can ask for, or levelOf has no level to give it.
+        const float rMax = std::max(p.ppm_radius_initial, p.radius_max);
+        if (levelCellSize(p.level_s0, MAX_LEVELS - 1) < rMax) {
+            std::cerr << "--s0 " << p.level_s0 << " is too small: the top level's cells ("
+                      << levelCellSize(p.level_s0, MAX_LEVELS - 1)
+                      << ") are narrower than a radius of " << rMax << "\n";
+            return 2;
+        }
+    }
+    p.cull_mask_bits = (unsigned int)args.maskBits;
+    p.table_load = args.tableLoad;
+    p.splat_cell_factor = args.splatCellFactor;
+    p.splat_stripes = args.splatStripes;
+    p.inline_positions = args.inlinePositions ? 1 : 0;
+    p.hier_mask = args.hierMask ? 1 : 0;
+    gCulling = args.culling;
+
+    // The adaptive radius re-gathers with a radius picked from the photon
+    // count; a per-pixel radius is already a per-pixel choice, and the two do
+    // not compose.  Splatting fixes every radius before the photons are
+    // traced, so it cannot pick one from what they deliver.
+    if (p.radius_mode == RADIUS_FOOTPRINT)
+        p.adaptive_radius = 0;
+    if (isSplatting(gAccel)) {
+        if (p.adaptive_radius)
+            std::cout << "[Splat] the adaptive radius needs the photons before the radius;"
+                         " off for splatting\n";
+        p.adaptive_radius = 0;
+        if (gCulling)
+            std::cout << "[Splat] --culling is ignored: splatting culls implicitly\n";
+        gCulling = false;
+    }
+
     if (args.photonPaths > 0)
         p.num_photon_paths = args.photonPaths;
     if (args.maxDepth > 0)
@@ -2665,8 +4148,15 @@ int main(int argc, char** argv) {
         cudaFree(reinterpret_cast<void*>(state.dLights));
     cudaFree(reinterpret_cast<void*>(state.drg_photon));
     cudaFree(reinterpret_cast<void*>(state.drg_camera));
-    cudaFree(reinterpret_cast<void*>(state.drg_query));
+    cudaFree(reinterpret_cast<void*>(state.drg_splat));
+    cudaFree(reinterpret_cast<void*>(state.drg_stochsplat));
+    for (int i = 0; i < 5; ++i)
+        cudaFree(reinterpret_cast<void*>(state.drg_fused[i]));
     cudaFree(reinterpret_cast<void*>(state.drg_lightvis));
+    cudaFree(state.dUsedLevels);
+    cudaFree(state.dDepositCounts);
+    cudaFree(state.dCullMask);
+    cudaFree(state.dCullParent);
     for (auto tex : state.texObjects)
         cudaDestroyTextureObject(tex);
     for (auto arr : state.texArrays)

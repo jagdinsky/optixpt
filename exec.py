@@ -1,21 +1,70 @@
 #!/usr/bin/env python3
-"""Render one converged path-traced reference plus a small grid of photon-mapped
-images in a single call.
+"""Render the same view in four modes in a single call.
 
-    python3 exec.py                    # reference + 4 photon renders into ./renders
-    python3 exec.py --dry-run          # print the render commands only
-    python3 exec.py --budget 600       # give the reference 10 minutes instead of 4
-    python3 exec.py --pt-frames 3060   # fix the reference frame count, skip calibration
+    python3 exec.py                         # the 4 images into ./renders
+    python3 exec.py --dry-run               # print the render commands only
+    python3 exec.py --hash-frames 512       # more frames for one of them
 
-The reference is a path trace at --pt-depth with as many frames as fit in
---budget seconds; the frame count is picked from two short probe renders rather
-than guessed, so the same budget lands on the same wall-clock time on any GPU.
-The photon images are the four corners of {small,big} frames x {small,big}
-depth, which is the pair of axes worth showing: frames average the density
-estimate down, depth decides how much of the transport is in it at all.
+The four images, every setting in the name:
+
+    pt_f<F>_d<D>_s<S>.exr                  path tracing
+    pm_hash_f<F>_d<D>_p<P>_s<S>.exr        photon mapping, full hash grid
+    pm_stochastic_f<F>_d<D>_p<P>_s<S>.exr  photon mapping, stochastic hash grid
+    pm_rectified_f<F>_d<D>_p<P>_s<S>.exr   photon mapping, rectified stochastic hash grid
+
+All four share --depth and --seed.  The depth matters most: the shared
+path-length budget is what makes photon mapping and path tracing solve the same
+problem.  Each gets its own frame count, because a frame costs and buys very
+different amounts in each mode:
+
+    path tracing     1024  the reference, as converged as is affordable
+                           (a frame here is 4 camera samples, not 1)
+    full hash grid    256  every photon within the radius, the slow lookup
+    stochastic       1024  one photon per bucket: a cheap lookup, but a much
+    rectified        1024  noisier frame, so they need many more of them
+
+More frames also means a smaller final radius under the PPM schedule
+(r_N ~ N^-1/6 at alpha = 2/3), so a photon image at 1024 frames is somewhat
+sharper, not only less noisy, than one at 256.
+
+The three photon renders share --paths, so frame i traces the very same
+photons from the very same gather points in all three, and any difference
+between them is the lookup's.  The full hash grid adds up every photon within
+the radius.  The stochastic grids keep one photon per bucket and scale it by
+the bucket's photon count, so they estimate that same sum: the rectified grid
+(reservoir sampling) without bias, the original one biased towards photons
+deposited late in the trace (Davidovic et al. 2014, sec. 6.3).
 
 Everything runs with cwd = build/, because the renderer resolves the scene and
-the camera relative to ../scenes/.  Outputs are EXR, written to --out.
+the camera relative to ../scenes/.  Outputs are EXR, written to --out, with a
+manifest.json recording the settings and the exact command of each image.
+
+--radius-mode, --k-pix and --culling are passed on to the three photon
+renders, and recorded in their file names when given:
+
+    pm_<accel>[_footprint[_k<K>]][_culling]_f<F>_d<D>_p<P>_s<S>.exr
+
+The benchmark (--bench) renders no image set.  It times the structures this
+work compares, each over the same frames, and prints the table:
+
+    python3 exec.py --bench                 # 7 configurations x 3 runs
+    python3 exec.py --bench --dry-run       # the commands only
+
+    hash/global                 full hash grid, one radius per frame
+    hash/footprint              full hash grid, per-pixel radius (cell = the
+                                largest radius of the frame)
+    mlhash/footprint            multi-level hash grid, per-pixel radius
+    mlhash/footprint+culling    the same, storing only reachable photons
+    rect/global                 rectified stochastic hash grid, one radius
+    mlrect/footprint            multi-level rectified grid, per-pixel radius
+    mlrect/footprint+culling    the same, with culling
+
+Every run is the renderer's own per-pass timing (--timing-json), averaged
+over the frames after --bench-warmup; the table is the median over
+--bench-runs runs of those averages, so a run disturbed by something else on
+the machine does not move it.  Defaults: 1280x720, 1M photon paths, depth 8,
+128 frames, 8 warm-up frames, 3 runs.  Timing JSONs, images and bench.json /
+bench.md go to --bench-out (build/bench).
 """
 
 import argparse
@@ -26,7 +75,11 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-BUILD = os.path.join(ROOT, "build")
+# build-release/, a Release build no IDE reconfigures (build/ follows whatever
+# variant the editor's CMake integration picks), or RENDERER_BUILD.
+BUILD = os.path.abspath(os.environ.get("RENDERER_BUILD") or (
+    os.path.join(ROOT, "build-release") if os.path.isdir(os.path.join(ROOT, "build-release"))
+    else os.path.join(ROOT, "build")))
 RENDERER = os.path.join(BUILD, "renderer")
 SRC = os.path.join(ROOT, "src")
 
@@ -35,18 +88,26 @@ RENDER_ENV = dict(os.environ)
 RENDER_ENV["__NV_PRIME_RENDER_OFFLOAD"] = "1"
 RENDER_ENV["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 
-# Two probe lengths far enough apart that the fit separates startup from the
-# per-frame cost, and short enough that they cost well under a minute.
-PROBE_FRAMES = (8, 32)
+# The four renders: the renderer's --accel value (None = path tracing), the
+# prefix of its --<prefix>-frames option, what to call it, and its default
+# frame count (see the table in the docstring).
+MODES = (
+    (None, "pt", "path tracing", 2048),
+    ("hash", "hash", "photon mapping, full hash grid", 512),
+    ("stochastic", "stochastic", "photon mapping, stochastic hash grid", 2048),
+    ("rectified", "rectified", "photon mapping, rectified stochastic hash grid", 2048),
+)
 
-# The measured per-frame cost of a probe is optimistic: a long render heats the
-# GPU up and clocks it down.  Budget for the slower steady state.
-SLOWDOWN = 1.25
+
+def frames_of(args, prefix):
+    return getattr(args, prefix + "_frames")
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Render a path-traced reference and a grid of photon-mapped images.",
+        description="Render the same view with path tracing and with photon "
+                    "mapping through the full, stochastic and rectified "
+                    "stochastic hash grids.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--scene", default="scene.glb",
@@ -55,24 +116,24 @@ def parse_args():
                    help="camera file, resolved by the renderer inside scenes/")
     p.add_argument("--out", default=os.path.join(ROOT, "renders"),
                    help="directory to write the EXRs and manifest.json into")
+
+    for _, prefix, label, frames in MODES:
+        p.add_argument("--%s-frames" % prefix, type=int, default=frames,
+                       metavar="N", help="frames to accumulate for " + label)
+    p.add_argument("--depth", type=int, default=32,
+                   help="max path length, the same for all four renders")
     p.add_argument("--seed", type=int, default=1,
-                   help="random seed shared by every render in the run")
-
-    p.add_argument("--budget", type=float, default=240.0,
-                   help="seconds of rendering to spend on the path-traced reference")
-    p.add_argument("--pt-frames", type=int, default=0,
-                   help="fixed reference frame count; skips the timing probes")
-    p.add_argument("--pt-depth", type=int, default=32,
-                   help="max path length for the reference")
-
-    p.add_argument("--frames", type=int, nargs=2, default=[32, 128],
-                   metavar=("SMALL", "BIG"), help="photon-mapping frame counts")
-    p.add_argument("--depths", type=int, nargs=2, default=[8, 32],
-                   metavar=("SMALL", "BIG"), help="photon-mapping max path lengths")
+                   help="random seed, the same for all four renders")
     p.add_argument("--paths", type=int, default=1_000_000,
-                   help="photon paths per frame")
-    p.add_argument("--accel", choices=("grid", "hash", "brute"), default="grid",
-                   help="acceleration structure the photon gather searches with")
+                   help="photon paths per frame (photon mapping only)")
+
+    p.add_argument("--radius-mode", choices=("global", "footprint"), default=None,
+                   help="photon renders: one radius per frame, or one per pixel "
+                        "from its footprint; omitted keeps the renderer default (global)")
+    p.add_argument("--k-pix", type=float, default=None,
+                   help="photon renders: footprint radius in pixels (renderer default 4)")
+    p.add_argument("--culling", choices=("on", "off"), default=None,
+                   help="photon renders: store only photons a lookup can reach")
 
     p.add_argument("--sky", type=float, default=None,
                    help="sky intensity; omitted keeps the renderer default (off)")
@@ -83,10 +144,36 @@ def parse_args():
                    help="run cmake --build on build/ before rendering")
     p.add_argument("--force", action="store_true",
                    help="re-render images that already exist in --out")
-    p.add_argument("--skip-reference", action="store_true",
-                   help="render only the photon-mapped images")
     p.add_argument("--dry-run", action="store_true",
-                   help="print the render commands and the plan, render nothing")
+                   help="print the render commands, render nothing")
+
+    b = p.add_argument_group("benchmark")
+    b.add_argument("--bench", action="store_true",
+                   help="time the seven configurations of the comparison instead "
+                        "of rendering the image set")
+    b.add_argument("--bench-runs", type=int, default=3, help="runs per configuration")
+    b.add_argument("--bench-frames", type=int, default=128, help="frames per run")
+    b.add_argument("--bench-warmup", type=int, default=8,
+                   help="frames at the start of a run left out of its averages")
+    b.add_argument("--bench-paths", type=int, default=1_000_000, help="photon paths per frame")
+    b.add_argument("--bench-depth", type=int, default=8, help="max path length")
+    b.add_argument("--bench-res", type=int, nargs=2, default=(1280, 720),
+                   metavar=("W", "H"), help="resolution")
+    b.add_argument("--bench-out", default=os.path.join(ROOT, "build", "bench"),
+                   help="directory for the timing JSONs, images and the table")
+
+    e = p.add_argument_group("experiments (section 9 of the method comparison)")
+    e.add_argument("--experiments", action="store_true",
+                   help="run the experiment matrix: E1-E3 (timing tables), E5-E6 (error "
+                        "against time), E7 (variance diagnostic), then --report")
+    e.add_argument("--reduced", action="store_true",
+                   help="the reduced matrix: 1 seed and 1024 frames for E5/E6, 256 frames for E7")
+    e.add_argument("--only", default="E1,E2,E3,E4,E5,E6,E7",
+                   help="comma-separated experiments to run")
+    e.add_argument("--scenes", default="cornell,stadium,rooms,caustic",
+                   help="comma-separated scenes (eval/evalio.py's names)")
+    e.add_argument("--report", action="store_true",
+                   help="write build/experiments/report.md from the results there")
     return p.parse_args()
 
 
@@ -116,6 +203,23 @@ def check_environment(args):
         print("warning: %s is older than %s — rebuild if these renders should include it"
               % (os.path.relpath(RENDERER, ROOT), ", ".join(newer)))
 
+    warn_build_type()
+
+
+def warn_build_type():
+    # Timings are only the thesis's numbers from a Release build (the timing
+    # JSON of every render records which one it was).
+    cache = os.path.join(BUILD, "CMakeCache.txt")
+    build_type = None
+    if os.path.isfile(cache):
+        with open(cache) as f:
+            for line in f:
+                if line.startswith("CMAKE_BUILD_TYPE:"):
+                    build_type = line.split("=", 1)[1].strip()
+    if build_type != "Release":
+        print("warning: %s is a %s build — times measured with it are not Release numbers"
+              % (os.path.relpath(BUILD, ROOT), build_type or "unknown"))
+
 
 def build():
     print("building ...")
@@ -125,27 +229,41 @@ def build():
         fail("build failed")
 
 
-def timing_path(output):
-    """Where the renderer drops its per-pass timings for this image."""
-    return os.path.splitext(output)[0] + ".timing.json"
+def image_name(args, accel, frames):
+    if accel is None:
+        return "pt_f%d_d%d_s%d.exr" % (frames, args.depth, args.seed)
+    variant = ""
+    if args.radius_mode == "footprint":
+        variant += "_footprint"
+        if args.k_pix is not None:
+            variant += "_k%g" % args.k_pix
+    if args.culling == "on":
+        variant += "_culling"
+    return "pm_%s%s_f%d_d%d_p%d_s%d.exr" % (accel, variant, frames, args.depth,
+                                            args.paths, args.seed)
 
 
-def render_cmd(args, *, photon, frames, depth, output, paths=None):
+def render_cmd(args, *, frames, output, accel=None):
+    """A path trace, or with `accel` a photon-mapped render through that structure."""
     cmd = [RENDERER, args.scene, "--offline",
            "--camera", args.camera,
            "--output", output,
            "--frames", str(frames),
-           "--depth", str(depth),
+           "--depth", str(args.depth),
            "--seed", str(args.seed)]
-    if photon:
+    if accel is not None:
         cmd.append("--photon")
-        cmd += ["--paths", str(paths if paths is not None else args.paths)]
-        cmd += ["--accel", args.accel]
-        # The process time below covers glTF parsing, the acceleration build and
-        # the PTX compile as well as the render.  For anything comparing photon
-        # lookups that is the wrong number, so the renderer reports its own
-        # per-pass, per-frame timings and they get stored next to the image.
-        cmd += ["--timing-json", timing_path(output)]
+        cmd += ["--paths", str(args.paths)]
+        cmd += ["--accel", accel]
+        # The renderer's own per-pass, per-frame timings, stored next to the
+        # image — the trace/build/query split is where the three grids differ.
+        cmd += ["--timing-json", os.path.splitext(output)[0] + ".timing.json"]
+        if args.radius_mode is not None:
+            cmd += ["--radius-mode", args.radius_mode]
+        if args.k_pix is not None:
+            cmd += ["--k-pix", str(args.k_pix)]
+        if args.culling is not None:
+            cmd += ["--culling", args.culling]
     if args.sky is not None:
         cmd += ["--sky", str(args.sky)]
     if args.sky_photons is not None:
@@ -163,7 +281,7 @@ def shell(cmd):
 
 def run_render(cmd, output, dry_run):
     """Run one render with its progress going straight to the terminal."""
-    print("\n$ " + shell(cmd) + "   (cwd: build/)")
+    print("\n$ " + shell(cmd) + "   (cwd: %s/)" % os.path.relpath(BUILD, ROOT))
     if dry_run:
         return 0.0
     t0 = time.time()
@@ -175,38 +293,6 @@ def run_render(cmd, output, dry_run):
         fail("render reported success but wrote no image: %s" % output)
     print("  -> %s  (%s)" % (short_path(output), hms(seconds)))
     return seconds
-
-
-def read_timings(path):
-    """The renderer's per-pass timings, summarised for the manifest.
-
-    Means are taken over the frames past the warm-up, which is the same set the
-    renderer prints — a render whose frames are all warm-up reports nothing.
-    """
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (IOError, ValueError):
-        return None
-
-    frames = data.get("per_frame", [])
-    timed = frames[data.get("warmup", 0):]
-    if not timed:
-        return None
-
-    passes = ("photon_trace_ms", "build_ms", "camera_ms", "query_ms", "accum_ms")
-    mean = {k: sum(fr.get(k, 0.0) for fr in timed) / len(timed) for k in passes}
-    mean["total_ms"] = sum(mean.values())
-    return {
-        "accel": data.get("accel"),
-        "timed_frames": len(timed),
-        "mean_ms": mean,
-        "first_radius": timed[0].get("radius"),
-        "last_radius": timed[-1].get("radius"),
-        "mean_photons": sum(fr.get("photons", 0) for fr in timed) / len(timed),
-        "mean_cells": sum(fr.get("cells", 0) for fr in timed) / len(timed),
-        "mean_buckets": sum(fr.get("buckets", 0) for fr in timed) / len(timed),
-    }
 
 
 def short_path(path):
@@ -226,71 +312,381 @@ def hms(seconds):
     return "%ds" % s
 
 
-def calibrate(args, tmp_output):
-    """Fit seconds = startup + per_frame * frames from two short path traces."""
-    print("calibrating the reference frame count against a %s budget ..."
-          % hms(args.budget))
-    probes = []
-    for frames in PROBE_FRAMES:
-        cmd = render_cmd(args, photon=False, frames=frames, depth=args.pt_depth,
-                         output=tmp_output)
-        probes.append((frames, run_render(cmd, tmp_output, args.dry_run)))
+# The benchmark's configurations: a label and the renderer options behind it.
+BENCH = (
+    ("hash/global", ["--accel", "hash"]),
+    ("hash/footprint", ["--accel", "hash", "--radius-mode", "footprint"]),
+    ("mlhash/footprint", ["--accel", "mlhash", "--radius-mode", "footprint"]),
+    ("mlhash/footprint+culling", ["--accel", "mlhash", "--radius-mode", "footprint",
+                                  "--culling", "on"]),
+    ("rect/global", ["--accel", "rectified"]),
+    ("mlrect/footprint", ["--accel", "mlrect", "--radius-mode", "footprint"]),
+    ("mlrect/footprint+culling", ["--accel", "mlrect", "--radius-mode", "footprint",
+                                  "--culling", "on"]),
+)
+
+# Per-pass times, in the order a frame runs them (mark: culling only;
+# finalize: splatting only, whose build and photon pass are the point grid and
+# the splatting pass; fused: --fused, the camera walk and the lookup in one).
+PASSES = (("camera", "camera_ms"), ("mark", "mark_ms"), ("photon", "photon_trace_ms"),
+          ("build", "build_ms"), ("query", "query_ms"), ("finalize", "finalize_ms"),
+          ("fused", "fused_ms"), ("accum", "accum_ms"))
+
+# Per-frame statistics averaged alongside the times.
+STATS = ("bytes", "photons", "deposits", "culled", "entries", "buckets",
+         "num_levels", "level_min", "level_max", "r_px_mean", "pairs", "reached")
+
+
+def summarise_run(tjson, warmup):
+    """Means over one run's frames after the warm-up."""
+    with open(tjson) as f:
+        frames = json.load(f)["per_frame"]
+    frames = frames[warmup:] or frames
+    out = {}
+    for key, field in PASSES:
+        out[key] = sum(fr.get(field, 0.0) for fr in frames) / len(frames)
+    out["total"] = sum(out[key] for key, _ in PASSES)
+    for key in STATS:
+        out[key] = sum(fr.get(key, 0) for fr in frames) / len(frames)
+    out["level_min"] = min(fr.get("level_min", -1) for fr in frames)
+    out["level_max"] = max(fr.get("level_max", -1) for fr in frames)
+    return out
+
+
+def median(values):
+    v = sorted(values)
+    n = len(v)
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def bench(args):
+    out = args.bench_out
+    w, h = args.bench_res
+    settings = "f%d_d%d_p%d_r%dx%d_s%d" % (args.bench_frames, args.bench_depth,
+                                          args.bench_paths, w, h, args.seed)
+    if not args.dry_run:
+        os.makedirs(out, exist_ok=True)
+    print("benchmark: %d configurations x %d runs, %dx%d, %d paths, depth %d, "
+          "%d frames (%d warm-up), seed %d"
+          % (len(BENCH), args.bench_runs, w, h, args.bench_paths, args.bench_depth,
+             args.bench_frames, args.bench_warmup, args.seed))
+
+    rows = []
+    for label, extra in BENCH:
+        tag = label.replace("/", "_").replace("+", "_")
+        runs = []
+        for k in range(args.bench_runs):
+            stem = "%s_%s_run%d" % (tag, settings, k)
+            output = os.path.join(out, stem + ".exr")
+            tjson = os.path.join(out, stem + ".timing.json")
+            cmd = [RENDERER, args.scene, "--offline", "--photon",
+                   "--camera", args.camera,
+                   "--res", str(w), str(h),
+                   "--frames", str(args.bench_frames),
+                   "--paths", str(args.bench_paths),
+                   "--depth", str(args.bench_depth),
+                   "--seed", str(args.seed),
+                   "--warmup", str(args.bench_warmup),
+                   "--timing-json", tjson,
+                   "--output", output] + extra
+            print("\n[%s, run %d/%d]" % (label, k + 1, args.bench_runs))
+            run_render(cmd, output, args.dry_run)
+            if not args.dry_run:
+                runs.append(summarise_run(tjson, args.bench_warmup))
+        if runs:
+            med = {key: median([r[key] for r in runs]) for key in runs[0]}
+            rows.append({"config": label, "options": extra, "median": med, "runs": runs})
 
     if args.dry_run:
-        # Nothing ran, so there is nothing to fit; the frame count the real run
-        # would pick stands in as a placeholder in the commands below.
-        return "N", {"dry_run": True}
+        print("\ndry run: nothing was rendered")
+        return
 
-    (f_lo, t_lo), (f_hi, t_hi) = probes
-    measured_per_frame = (t_hi - t_lo) / float(f_hi - f_lo)
-    if measured_per_frame <= 0:
-        fail("timing probes were not monotonic (%.2fs for %d frames, %.2fs for %d) — "
-             "the GPU is probably busy; re-run, or pass --pt-frames" %
-             (t_lo, f_lo, t_hi, f_hi))
-    per_frame = measured_per_frame * SLOWDOWN
-    startup = max(0.0, t_lo - f_lo * measured_per_frame)
+    head = ("| configuration | camera | photon | build | query | accum | total (ms) "
+            "| structure (MiB) | stored | culled | entries | levels | T |")
+    lines = [head, "|" + "---|" * 13]
+    for r in rows:
+        m = r["median"]
+        levels = ("%.1f (%d..%d)" % (m["num_levels"], m["level_min"], m["level_max"])
+                  if m["level_max"] >= 0 else "-")
+        lines.append("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %.0f | %s | %s | %s | %s |" % (
+            r["config"], m["camera"], m["photon"], m["build"], m["query"], m["accum"],
+            m["total"], m["bytes"] / (1024.0 * 1024.0), m["photons"],
+            "%.1f%%" % (100 * m["culled"]) if m["culled"] > 0 else "-",
+            "%.0f" % m["entries"] if m["entries"] > 0 else "-", levels,
+            "%.0f" % m["buckets"] if m["buckets"] > 0 else "-"))
+    table = "\n".join(lines)
+    note = ("ms per frame: per run the mean over frames %d..%d, then the median over "
+            "%d runs.  structure = memory the lookup reads (not the photon map); "
+            "stored = photons in the map; T = buckets."
+            % (args.bench_warmup, args.bench_frames - 1, args.bench_runs))
+    print("\n" + table + "\n\n" + note)
+    with open(os.path.join(out, "bench_%s.md" % settings), "w") as f:
+        f.write(table + "\n\n" + note + "\n")
+    with open(os.path.join(out, "bench_%s.json" % settings), "w") as f:
+        json.dump({"settings": {"res": [w, h], "frames": args.bench_frames,
+                                "warmup": args.bench_warmup, "paths": args.bench_paths,
+                                "depth": args.bench_depth, "seed": args.seed,
+                                "runs": args.bench_runs, "scene": args.scene,
+                                "camera": args.camera},
+                   "rows": rows}, f, indent=2)
+    print("table and per-run numbers in %s" % short_path(out))
 
-    frames = int((args.budget - startup) / per_frame)
-    frames = max(1, frames)
-    info = {
-        "startup": startup,
-        "measured_per_frame": measured_per_frame,
-        "slowdown": SLOWDOWN,
-        "per_frame": per_frame,
-        "probes": probes,
-        "predicted": startup + frames * per_frame,
-    }
-    print("  startup %.2fs, %.4fs/frame (x%.2f) -> %d frames, ~%s"
-          % (startup, measured_per_frame, SLOWDOWN, frames, hms(info["predicted"])))
-    return frames, info
+
+# --------------------------------------------------------------------------
+# The experiments (section 9).
+#
+# E1-E3 compare configurations that render the same image (or, for the
+# one-photon-per-bucket grids, the same image in expectation): their per-pass
+# times, totals and memory, at 1280x720, 1M photon paths, depth 8, the median
+# of 3 runs of 128 frames after an 8-frame warm-up, per scene.
+# E5-E6 compare error against GPU time (eval/error_vs_time.py), E7 is the
+# variance diagnostic (eval/variance.py).
+
+EXPERIMENTS = os.path.join(ROOT, "build", "experiments")
+EVAL = os.path.join(ROOT, "eval")
+
+SAME_IMAGE = {
+    "E1": ("levels: one cell size against a level per lookup",
+           ["A/hash/footprint", "A/mlhash/footprint", "A/rect/footprint", "A/mlrect/footprint"]),
+    "E2": ("culling: the full photon map (A) against the culled one (B)",
+           ["%s/%s/%s" % (f, a, m) for a in ("hash", "rect", "mlhash", "mlrect")
+            for m in ("global", "footprint") for f in ("A", "B")]),
+    "E3": ("gather against splat",
+           ["B/mlhash/footprint", "C/mlsplat/footprint", "C/mlsplat/footprint+F1",
+            "C/mlsplat/footprint+K4", "A/hash/global", "C/splat/global",
+            "A/hash/footprint", "C/splat/footprint", "C/splat/footprint+F1"]),
+    "E4": ("optional features: inline positions, hierarchical mask, fused family A",
+           ["A/hash/footprint", "A/hash/footprint+inline", "A/mlhash/footprint",
+            "A/mlhash/footprint+inline", "B/mlhash/footprint", "B/mlhash/footprint+inline",
+            "C/mlsplat/footprint", "C/mlsplat/footprint+inline",
+            "B/hash/footprint", "B/hash/footprint+hier", "B/mlhash/footprint+hier",
+            "B/mlrect/footprint", "B/mlrect/footprint+hier",
+            "A/hash/footprint+fused", "A/mlhash/footprint+fused", "A/hash/global",
+            "A/hash/global+fused", "A/rect/footprint", "A/rect/footprint+fused",
+            "A/mlrect/footprint", "A/mlrect/footprint+fused"]),
+}
+
+
+def config_options(label):
+    """Renderer options of '<family>/<accel>/<mode>[+F1][+K4]'."""
+    base, _, variant = label.partition("+")
+    family, accel, mode = base.split("/")
+    opts = ["--accel", accel, "--radius-mode", mode]
+    if family != "C":
+        opts += ["--culling", "on" if family == "B" else "off"]
+    for v in filter(None, variant.split("+")):
+        if v == "inline":
+            opts += ["--inline-positions"]
+        elif v == "hier":
+            opts += ["--hier-mask"]
+        elif v == "fused":
+            opts += ["--fused"]
+        elif v.startswith("F"):
+            opts += ["--splat-cell-factor", v[1:]]
+        elif v.startswith("K"):
+            opts += ["--splat-stripes", v[1:]]
+    return opts
+
+
+def scene_files(scene):
+    sys.path.insert(0, EVAL)
+    import evalio
+    return evalio.SCENES[scene]
+
+
+def run_same_image(args, scenes, which):
+    """E1-E3: every configuration they name, per scene, 3 runs; the medians."""
+    labels = []
+    for e in which:
+        for label in SAME_IMAGE[e][1]:
+            if label not in labels:
+                labels.append(label)
+    results = {}
+    for scene in scenes:
+        glb, cam = scene_files(scene)
+        out = os.path.join(EXPERIMENTS, "same_image", scene)
+        if not args.dry_run:
+            os.makedirs(out, exist_ok=True)
+        for label in labels:
+            runs = []
+            for k in range(args.bench_runs):
+                stem = os.path.join(out, "%s_run%d" % (label.replace("/", "_").replace("+", "_"), k))
+                tjson = stem + ".timing.json"
+                cmd = [RENDERER, glb, "--offline", "--photon", "--camera", cam,
+                       "--res", "1280", "720", "--frames", str(args.bench_frames),
+                       "--paths", "1000000", "--depth", "8", "--seed", str(args.seed),
+                       "--warmup", str(args.bench_warmup), "--timing-json", tjson,
+                       "--output", stem + ".exr"] + config_options(label)
+                if os.path.exists(tjson) and not args.force:
+                    print("  %s %s run %d: done" % (scene, label, k + 1))
+                else:
+                    print("\n[%s, %s, run %d/%d]" % (scene, label, k + 1, args.bench_runs))
+                    run_render(cmd, stem + ".exr", args.dry_run)
+                if not args.dry_run:
+                    runs.append(summarise_run(tjson, args.bench_warmup))
+            if runs:
+                med = {key: median([r[key] for r in runs]) for key in runs[0]}
+                results.setdefault(scene, {})[label] = {"median": med, "runs": runs}
+    if not args.dry_run:
+        os.makedirs(EXPERIMENTS, exist_ok=True)
+        path = os.path.join(EXPERIMENTS, "same_image.json")
+        old = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                old = json.load(f)
+        for scene, rows in results.items():
+            old.setdefault(scene, {}).update(rows)
+        with open(path, "w") as f:
+            json.dump(old, f, indent=2)
+
+
+def run_tool(cmd, dry_run):
+    print("\n$ " + " ".join(cmd))
+    if dry_run:
+        return
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        fail("%s failed" % os.path.basename(cmd[1]))
+
+
+def experiments(args):
+    scenes = args.scenes.split(",")
+    which = [e.strip() for e in args.only.split(",")]
+    frames = 1024 if args.reduced else 4096
+    seeds = "1" if args.reduced else "1,2,3"
+    same = [e for e in which if e in SAME_IMAGE]
+    if same:
+        run_same_image(args, scenes, same)
+    for scene in scenes:
+        if "E5" in which:
+            run_tool([sys.executable, os.path.join(EVAL, "error_vs_time.py"), "--scene", scene,
+                      "--render", "--frames", str(frames), "--seeds", seeds, "--k-pix", "2,4,8",
+                      "--out", os.path.join(EXPERIMENTS, "E5"), "--configs",
+                      "A/hash/footprint", "A/rect/footprint", "B/mlhash/footprint",
+                      "B/mlrect/footprint"] + (["C/mlsplat/footprint@4", "C/stochsplat/footprint@4"]
+                                               if args.reduced else
+                                               ["C/mlsplat/footprint", "C/stochsplat/footprint"]),
+                     args.dry_run)
+        if "E6" in which:
+            run_tool([sys.executable, os.path.join(EVAL, "error_vs_time.py"), "--scene", scene,
+                      "--render", "--frames", str(frames), "--seeds", seeds, "--k-pix", "4",
+                      "--out", os.path.join(EXPERIMENTS, "E6"), "--configs",
+                      "B/mlhash/global", "B/mlhash/footprint", "A/hash/global",
+                      "A/hash/footprint"], args.dry_run)
+        if "E7" in which:
+            run_tool([sys.executable, os.path.join(EVAL, "variance.py"), "--scene", scene,
+                      "--render", "--frames", str(256 if args.reduced else 1024),
+                      "--dump-every", "16", "--pairs", "B/mlhash:B/mlrect", "A/hash:A/rect",
+                      "C/mlsplat:C/stochsplat"], args.dry_run)
+    if not args.dry_run:
+        write_report()
+
+
+def write_report():
+    """build/experiments/report.md from what the experiments left there."""
+    lines = ["# Photon-gather method families: experiment results", ""]
+    path = os.path.join(EXPERIMENTS, "same_image.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            same = json.load(f)
+        for e, (title, labels) in SAME_IMAGE.items():
+            lines += ["## %s — %s" % (e, title), ""]
+            for scene, rows in same.items():
+                present = [l for l in labels if l in rows]
+                if not present:
+                    continue
+                lines += ["**%s** (ms per frame, median of %d runs)" % (scene, len(rows[present[0]]["runs"])), "",
+                          "| configuration | camera | mark | photon | build | query | finalize | fused | total "
+                          "| structure MiB | stored | culled | entries | T |",
+                          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+                for l in present:
+                    m = rows[l]["median"]
+                    lines.append("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | **%.2f** | %.1f | %.0f | %s | %.0f | %.0f |" % (
+                        l, m["camera"], m.get("mark", 0), m["photon"], m["build"], m["query"],
+                        m.get("finalize", 0), m.get("fused", 0), m["total"], m["bytes"] / 1048576.0, m["photons"],
+                        "%.1f%%" % (100 * m["culled"]) if m["culled"] > 0 else "-",
+                        m["entries"], m["buckets"]))
+                lines.append("")
+    for e, title in (("E5", "stochastic against exact, error against GPU time"),
+                     ("E6", "radius policy, error against GPU time")):
+        base = os.path.join(EXPERIMENTS, e)
+        if not os.path.isdir(base):
+            continue
+        lines += ["## %s — %s" % (e, title), ""]
+        for scene in sorted(os.listdir(base)):
+            js = os.path.join(base, scene, "error_vs_time.json")
+            if not os.path.exists(js):
+                continue
+            with open(js) as f:
+                s = json.load(f)
+            lines += ["**%s** — reference relMSE %.2g; %d frames, seeds %s; figures in %s" % (
+                scene, s.get("reference_relmse") or float("nan"), s["frames"],
+                ",".join(str(x) for x in s["seeds"]), os.path.relpath(os.path.join(base, scene), ROOT)),
+                "", "| configuration | k_pix | GPU s | relMSE at the end | slope from 16 frames |",
+                "|---|---|---|---|---|"]
+            for ser in s["series"]:
+                pts = ser["points"]
+                lines.append("| %s | %s | %.2f | %.4g | %.3f |" % (
+                    ser["config"], "-" if ser["k_pix"] is None else "%g" % ser["k_pix"],
+                    pts[-1][1], pts[-1][2], ser["slope"]))
+            lines += ["", "best k_pix: " + ", ".join("%s %s" % (c, "-" if k is None else "%g" % k)
+                                                     for c, k in s["best_k"].items()), ""]
+    var_rows = []
+    runs = os.path.join(ROOT, "eval", "runs")
+    if os.path.isdir(runs):
+        for scene in sorted(os.listdir(runs)):
+            js = os.path.join(runs, scene, "variance.json")
+            if os.path.exists(js):
+                with open(js) as f:
+                    var_rows += json.load(f)
+    if var_rows:
+        lines += ["## E7 — fixed-radius variance diagnostic", "",
+                  "| scene | exact | stochastic | s | V_exact | V_sel | c | t exact | t stochastic | efficiency |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
+        for r in var_rows:
+            lines.append("| %s | %s | %s | %g | %.4g | %.4g | %.3f | %.2f | %.2f | %.3f |" % (
+                r["scene"], r["exact"], r["stochastic"], r["scale"], r["V_exact"], r["V_sel"],
+                r["c"], r["t_exact_ms"], r["t_stochastic_ms"], r["efficiency"]))
+        lines.append("")
+    os.makedirs(EXPERIMENTS, exist_ok=True)
+    out = os.path.join(EXPERIMENTS, "report.md")
+    with open(out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("report: %s" % short_path(out))
 
 
 def main():
     args = parse_args()
     if args.build:
         build()
+    if args.report and not args.experiments:
+        write_report()
+        return
+    if args.experiments:
+        if not os.path.isfile(RENDERER):
+            fail("no renderer binary at %s" % RENDERER)
+        warn_build_type()
+        experiments(args)
+        return
     check_environment(args)
+    if args.bench:
+        bench(args)
+        return
 
     if not args.dry_run:
         os.makedirs(args.out, exist_ok=True)
     manifest_path = os.path.join(args.out, "manifest.json")
-    tmp_output = os.path.join(args.out, ".probe.exr")
-
-    frames_small, frames_big = sorted(args.frames)
-    depth_small, depth_big = sorted(args.depths)
 
     manifest = {
         "scene": args.scene,
         "camera": args.camera,
+        "depth": args.depth,
         "seed": args.seed,
         "paths": args.paths,
-        "accel": args.accel,
-        "budget": args.budget,
         "sky": args.sky,
         "sky_photons": args.sky_photons,
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "reference": None,
-        "photon": [],
+        "renders": [],
     }
 
     def save_manifest():
@@ -299,94 +695,35 @@ def main():
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
 
-    run_start = time.time()
+    print("%d renders: depth %d, seed %d, %d photon paths/frame"
+          % (len(MODES), args.depth, args.seed, args.paths))
 
-    # ---- the reference path trace -------------------------------------------
-    if not args.skip_reference:
-        if args.pt_frames > 0:
-            pt_frames = args.pt_frames
-        else:
-            pt_frames, manifest["calibration"] = calibrate(args, tmp_output)
-
-        name = "pt_ref_f%s_d%d_s%d.exr" % (pt_frames, args.pt_depth, args.seed)
+    for i, (accel, prefix, label, _) in enumerate(MODES):
+        frames = frames_of(args, prefix)
+        name = image_name(args, accel, frames)
         output = os.path.join(args.out, name)
-        cmd = render_cmd(args, photon=False, frames=pt_frames, depth=args.pt_depth,
-                         output=output)
-        entry = {"file": name, "mode": "path tracing", "frames": pt_frames,
-                 "depth": args.pt_depth, "seed": args.seed, "command": shell(cmd)}
-        if os.path.exists(output) and not args.force:
-            print("\nreference already rendered: %s (--force to redo)" % name)
-            entry["skipped"] = True
-        else:
-            print("\n=== reference path trace: %s frames, depth %d ==="
-                  % (pt_frames, args.pt_depth))
-            entry["seconds"] = run_render(cmd, output, args.dry_run)
-        manifest["reference"] = entry
-        save_manifest()
-
-    # ---- the photon-mapped grid ---------------------------------------------
-    # Cheapest first, so a run that gets interrupted still leaves the corners
-    # that are quickest to reproduce.
-    grid = [(f, d) for d in (depth_small, depth_big)
-            for f in (frames_small, frames_big)]
-    grid.sort(key=lambda fd: fd[0] * fd[1])
-
-    print("\n=== %d photon-mapped renders: frames %s x depth %s, %d paths/frame ==="
-          % (len(grid), (frames_small, frames_big), (depth_small, depth_big), args.paths))
-
-    unit_costs = []
-    for i, (frames, depth) in enumerate(grid):
-        suffix = "" if args.accel == "grid" else "_" + args.accel
-        name = "pm_f%d_d%d_p%d_s%d%s.exr" % (frames, depth, args.paths, args.seed, suffix)
-        output = os.path.join(args.out, name)
-        cmd = render_cmd(args, photon=True, frames=frames, depth=depth, output=output)
-        entry = {"file": name, "mode": "photon mapping", "frames": frames,
-                 "depth": depth, "paths": args.paths, "seed": args.seed,
-                 "accel": args.accel,
+        cmd = render_cmd(args, frames=frames, output=output, accel=accel)
+        entry = {"file": name, "mode": label, "accel": accel, "frames": frames,
                  "command": shell(cmd)}
         if os.path.exists(output) and not args.force:
-            print("\nalready rendered: %s (--force to redo)" % name)
+            print("\n[%d/%d] %s: already rendered, %s (--force to redo)"
+                  % (i + 1, len(MODES), label, name))
             entry["skipped"] = True
         else:
-            remaining = grid[i + 1:]
-            if unit_costs and remaining:
-                unit = sum(unit_costs) / len(unit_costs)
-                eta = sum(unit * f * d for f, d in remaining)
-                print("\n[%d/%d] frames %d, depth %d   (~%s left after this one)"
-                      % (i + 1, len(grid), frames, depth, hms(eta)))
-            else:
-                print("\n[%d/%d] frames %d, depth %d" % (i + 1, len(grid), frames, depth))
-            seconds = run_render(cmd, output, args.dry_run)
-            entry["seconds"] = seconds
-            entry["timing"] = read_timings(timing_path(output))
-            if seconds > 0:
-                unit_costs.append(seconds / float(frames * depth))
-        manifest["photon"].append(entry)
+            print("\n[%d/%d] %s, %d frames" % (i + 1, len(MODES), label, frames))
+            entry["seconds"] = run_render(cmd, output, args.dry_run)
+        manifest["renders"].append(entry)
         save_manifest()
-
-    manifest["total_seconds"] = time.time() - run_start
-    save_manifest()
-
-    if os.path.exists(tmp_output):
-        os.remove(tmp_output)
 
     if args.dry_run:
         print("\ndry run: nothing was rendered")
         return
 
-    print("\ndone in %s — images in %s"
-          % (hms(manifest["total_seconds"]), short_path(args.out)))
-    for entry in ([manifest["reference"]] if manifest["reference"] else []) + manifest["photon"]:
-        note = ""
-        timing = entry.get("timing")
-        if timing:
-            m = timing["mean_ms"]
-            note = "   per frame: %.1fms trace, %.1fms build, %.1fms query" % (
-                m["photon_trace_ms"], m["build_ms"], m["query_ms"])
-        print("  %-40s %s%s" % (entry["file"],
-                                "reused" if entry.get("skipped") else hms(entry["seconds"]),
-                                note))
-    print("  %-40s render settings and timings" % "manifest.json")
+    print("\ndone — images in %s" % short_path(args.out))
+    for entry in manifest["renders"]:
+        print("  %-44s %s" % (entry["file"],
+                              "reused" if entry.get("skipped") else hms(entry["seconds"])))
+    print("  %-44s render settings and commands" % "manifest.json")
 
 
 if __name__ == "__main__":

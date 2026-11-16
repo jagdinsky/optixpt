@@ -1,35 +1,10 @@
 #include <cuda_runtime.h>
 #include <optix.h>
 
+#include "gather.h"
 #include "params.h"
 
 extern "C" __constant__ Params params;
-
-// helpers
-__device__ __forceinline__ float3 operator+(float3 a, float3 b) { return make_float3(a.x + b.x, a.y + b.y, a.z + b.z); }
-__device__ __forceinline__ float3 operator-(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
-__device__ __forceinline__ float3 operator*(float t, float3 v) { return make_float3(t * v.x, t * v.y, t * v.z); }
-__device__ __forceinline__ float3 operator*(float3 v, float t) { return make_float3(t * v.x, t * v.y, t * v.z); }
-__device__ __forceinline__ float3 operator*(float3 a, float3 b) { return make_float3(a.x * b.x, a.y * b.y, a.z * b.z); }
-__device__ __forceinline__ float3 operator-(float3 a) { return make_float3(-a.x, -a.y, -a.z); }
-__device__ __forceinline__ float3& operator+=(float3& a, float3 b)
-{
-    a.x += b.x;
-    a.y += b.y;
-    a.z += b.z;
-    return a;
-}
-
-__device__ __forceinline__ float dot(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-__device__ __forceinline__ float3 cross(float3 a, float3 b) { return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
-__device__ __forceinline__ float3 normalize(float3 v)
-{
-    float len2 = dot(v, v);
-    if (len2 < 1e-20f) return make_float3(0.f, 0.f, 0.f);
-    float inv = rsqrtf(len2);
-    return make_float3(v.x * inv, v.y * inv, v.z * inv);
-}
-__device__ __forceinline__ float length(float3 v) { return sqrtf(dot(v, v)); }
 
 __device__ __forceinline__ float srgbToLinear(float c)
 {
@@ -48,251 +23,14 @@ __device__ __forceinline__ float3 sampleTexSRGB(cudaTextureObject_t tex,
         srgbToLinear(s.z));
 }
 
-// Decides whether a stored photon may contribute to the estimate at `x`.
-// The plain 3D distance test is not enough: a sphere of radius r around a point
-// near a corner also encloses photons that landed on the *neighbouring* wall,
-// and those are what leak across edges and show up as blotches.  Requiring the
-// photon to sit near the tangent plane turns the sphere into a thin disc, and
-// requiring a matching normal keeps the two sides of a thin wall apart.
-__device__ __forceinline__ bool photonUsable(const Photon& ph, float3 x, float3 n,
-    float r2, float planeTol, float normalTol, int maxPhotonDepth, float& d2)
-{
-    // Path length first, because it is the cheapest test and because getting it
-    // wrong is not a matter of a few stray photons: without it the camera walk
-    // and the photon walk each get their own max_depth, so photon mapping
-    // integrates paths up to twice as long as the path tracer does and the two
-    // modes stop solving the same problem.  See __raygen__gather for the budget.
-    if (ph.depth > maxPhotonDepth)
-        return false;
-    float3 diff = ph.pos - x;
-    d2 = dot(diff, diff);
-    if (d2 > r2)
-        return false;
-    if (dot(n, ph.normal) < normalTol)
-        return false;
-    if (fabsf(dot(diff, n)) > planeTol)
-        return false;
-    // The photon must have arrived on the side we are shading.
-    if (dot(n, ph.dir) <= 1e-4f)
-        return false;
-    return true;
-}
-
-// Tests the photons grid_photon_ids[start .. end) and accumulates the ones that
-// pass.  [start, end) is one cell of the uniform grid or one bucket of the hash
-// grid.  Both structures call this same loop, so the only thing that differs
-// between them is which ranges get visited — which is the thing being compared.
-__device__ __forceinline__ void gatherRange(int start, int end,
-    float3 hitpos, float3 n, float r2, float invR, float planeTol, float normalTol,
-    int maxPhotonDepth, float3& flux, int& count)
-{
-    const int* ids = params.grid.grid_photon_ids;
-    for (int k = start; k < end; ++k) {
-        const Photon& ph = params.photon_map[ids[k]];
-
-        float d2;
-        if (!photonUsable(ph, hitpos, n, r2, planeTol, normalTol,
-                maxPhotonDepth, d2))
-            continue;
-
-        float weight = 1.f - sqrtf(d2) * invR; // cone filter k=1
-        flux += weight * ph.power;
-        ++count;
-    }
-}
-
-// Cone-filtered flux within `r`, and how many photons contributed.  The count
-// is what lets the caller adapt the radius to the local photon density.
-__device__ void gatherPhotonsGrid(float3 hitpos, float3 n, float r, float r2,
-    int maxPhotonDepth, float3& flux, int& count)
-{
-    const PhotonGrid& g = params.grid;
-    flux = make_float3(0.f, 0.f, 0.f);
-    count = 0;
-
-    const float planeTol = params.photon_plane_tol * r;
-    const float normalTol = params.photon_normal_tol;
-    const float invR = 1.f / r;
-
-    // hitpos in grid coordinates
-    const int cx = photonCellCoord(hitpos.x, g.aabb_min.x, g.cell_size);
-    const int cy = photonCellCoord(hitpos.y, g.aabb_min.y, g.cell_size);
-    const int cz = photonCellCoord(hitpos.z, g.aabb_min.z, g.cell_size);
-
-    // go over neighboring cells (3x3x3); cell_size is the maximum gather
-    // radius, so this neighbourhood always covers the search sphere
-    for (int dz = -1; dz <= 1; ++dz) {
-        int nz = cz + dz;
-        if (nz < 0 || nz >= g.dims.z)
-            continue;
-        for (int dy = -1; dy <= 1; ++dy) {
-            int ny = cy + dy;
-            if (ny < 0 || ny >= g.dims.y)
-                continue;
-            for (int dx = -1; dx <= 1; ++dx) {
-                int nx = cx + dx;
-                if (nx < 0 || nx >= g.dims.x)
-                    continue;
-
-                const int cell = (nz * g.dims.y + ny) * g.dims.x + nx;
-                gatherRange(g.cell_start[cell], g.cell_start[cell + 1],
-                    hitpos, n, r2, invR, planeTol, normalTol, maxPhotonDepth,
-                    flux, count);
-            }
-        }
-    }
-}
-
-// The hash grid visits the same 3x3x3 cells as the uniform grid, but finds
-// each cell's photons through the hash table instead of a dense array.  Two
-// consequences of sharing buckets between cells:
-//
-// 1. A bucket can also hold photons from cells outside the 3x3x3 block that
-//    hashed to the same bucket (a collision).  They need no special handling.
-//    The block contains the whole search sphere, because a cell is at least r
-//    wide, so every photon outside the block is further than r from the query
-//    and the distance test in photonUsable rejects it.  A collision costs time,
-//    never correctness.
-//
-// 2. Two of the 27 cells can hash to the same bucket.  Visiting that bucket a
-//    second time would count its photons twice, which *is* a correctness
-//    error.  So the buckets already visited for this query are remembered, and
-//    a repeated one is skipped.  The list is at most 27 entries and lives in
-//    per-thread local memory, which is cached in L1.
-//
-// Unlike the uniform grid there is no bounds check: every integer cell has a
-// bucket, including cells outside the scene box, which simply hold no photons
-// of their own.
-__device__ void gatherPhotonsHash(float3 hitpos, float3 n, float r, float r2,
-    int maxPhotonDepth, float3& flux, int& count)
-{
-    const PhotonGrid& g = params.grid;
-    flux = make_float3(0.f, 0.f, 0.f);
-    count = 0;
-
-    const float planeTol = params.photon_plane_tol * r;
-    const float normalTol = params.photon_normal_tol;
-    const float invR = 1.f / r;
-
-    const int cx = photonCellCoord(hitpos.x, g.aabb_min.x, g.cell_size);
-    const int cy = photonCellCoord(hitpos.y, g.aabb_min.y, g.cell_size);
-    const int cz = photonCellCoord(hitpos.z, g.aabb_min.z, g.cell_size);
-
-    unsigned int visited[27];
-    int numVisited = 0;
-
-    for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                const unsigned int bucket
-                    = hashCell(cx + dx, cy + dy, cz + dz) & g.hash_mask;
-
-                bool alreadyVisited = false;
-                for (int j = 0; j < numVisited; ++j) {
-                    if (visited[j] == bucket) {
-                        alreadyVisited = true;
-                        break;
-                    }
-                }
-                if (alreadyVisited)
-                    continue;
-                visited[numVisited++] = bucket;
-
-                gatherRange(g.cell_start[bucket], g.cell_start[bucket + 1],
-                    hitpos, n, r2, invR, planeTol, normalTol, maxPhotonDepth,
-                    flux, count);
-            }
-        }
-    }
-}
-
-__device__ void gatherBruteForce(float3 hitpos, float3 n, float r, float r2,
-    int maxPhotonDepth, float3& flux, int& count)
-{
-    flux = make_float3(0.f, 0.f, 0.f);
-    count = 0;
-
-    const float planeTol = params.photon_plane_tol * r;
-    const float normalTol = params.photon_normal_tol;
-    const float invR = 1.f / r;
-
-    int stored = min(*params.photon_count, params.photon_capacity);
-    for (int i = 0; i < stored; i++) {
-        const Photon& ph = params.photon_map[i];
-
-        float d2;
-        if (!photonUsable(ph, hitpos, n, r2, planeTol, normalTol,
-                maxPhotonDepth, d2))
-            continue;
-
-        float weight = 1.f - sqrtf(d2) * invR;
-        flux += weight * ph.power;
-        ++count;
-    }
-}
-
-__device__ __forceinline__ void gatherPhotons(float3 hitpos, float3 n,
-    float r, float r2, int maxPhotonDepth, float3& flux, int& count)
-{
-    switch (params.accel) {
-    case ACCEL_UNIFORM_GRID:
-        gatherPhotonsGrid(hitpos, n, r, r2, maxPhotonDepth, flux, count);
-        break;
-    case ACCEL_HASH_GRID:
-        gatherPhotonsHash(hitpos, n, r, r2, maxPhotonDepth, flux, count);
-        break;
-    default:
-        gatherBruteForce(hitpos, n, r, r2, maxPhotonDepth, flux, count);
-        break;
-    }
-}
-
-// Irradiance from the photon map at a surface point.
-//
-// The cone filter w(d) = 1 - d/r integrates to  ∫(1 - d/r) dA = π r² / 3  over
-// the disc, so the density estimate is  E = 3 Σ w Φ / (π r²).
-//
-// With a single fixed radius the estimate is either too noisy (sparse regions)
-// or too blurry (dense ones) — the "big stains".  Probing the density at the
-// maximum radius first and then shrinking towards `target_photons` (photon
-// count grows with r², hence the sqrt) keeps well-lit regions sharp without
-// starving the dark ones.
-__device__ float3 photonIrradiance(float3 hitpos, float3 n, int maxPhotonDepth,
-    float& usedRadius)
-{
-    float r = params.gather_radius;
-    float r2 = r * r;
-    float3 flux;
-    int count;
-
-    gatherPhotons(hitpos, n, r, r2, maxPhotonDepth, flux, count);
-
-    if (params.adaptive_radius && params.target_photons > 0 && count > params.target_photons) {
-        float scale = sqrtf((float)params.target_photons / (float)count);
-        r *= fmaxf(scale, 0.05f);
-        r2 = r * r;
-        gatherPhotons(hitpos, n, r, r2, maxPhotonDepth, flux, count);
-    }
-
-    usedRadius = r;
-    if (count == 0)
-        return make_float3(0.f, 0.f, 0.f);
-    return flux * (3.f / (M_PIf * r2));
-}
-
 // SBT structs
 struct MissData {
     float3 bg_color;
 };
 struct RayGenData { };
 
-// PCG RNG
-__device__ unsigned int pcg(unsigned int& s)
-{
-    s = s * 747796405u + 2891336453u;
-    unsigned int w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-    return (w >> 22u) ^ w;
-}
+// PCG RNG.  pcg() and hashSeed3() live in params.h: the multi-level
+// rectified grid's insertion kernel, plain CUDA, draws from them too.
 __device__ float randf(unsigned int& rng) { return (pcg(rng) & 0xFFFFFF) / float(0x1000000); }
 
 // Seed mixer. Paths are seeded from (launch index, frame index); feeding those
@@ -326,22 +64,16 @@ __device__ __forceinline__ unsigned int hashSeed(unsigned int a, unsigned int b)
 // Note that the stream still depends only on (index, frame, seed), so frame i
 // is the same frame in an 8-frame and a 128-frame run: short runs remain
 // prefixes of long ones.
+//
+// The reservoir keys of the rectified stochastic hash grid get a stream of
+// their own for the same reason the passes do: drawn from the photon stream,
+// they would shift every later bounce, and that structure would no longer be
+// looking up the same photons as the others.
 #define RNG_STREAM_PATH 0x9E3779B9u
 #define RNG_STREAM_GATHER 0xBB67AE85u
 #define RNG_STREAM_PHOTON 0x3C6EF372u
-
-__device__ __forceinline__ unsigned int hashSeed3(unsigned int a, unsigned int b,
-    unsigned int c)
-{
-    unsigned int s = a * 0x9E3779B1u + b * 0x85EBCA6Bu + c * 0xC2B2AE35u
-        + 0x165667B1u;
-    s ^= s >> 16;
-    s *= 0x7FEB352Du;
-    s ^= s >> 15;
-    s *= 0x846CA68Bu;
-    s ^= s >> 16;
-    return s;
-}
+#define RNG_STREAM_RESERVOIR 0xA54FF53Au
+// RNG_STREAM_MLRECT, the multi-level rectified grid's keys, is in params.h.
 
 // Cosine-weighted hemisphere sample
 __device__ float3 cosineSampleHemisphere(float r1, float r2)
@@ -733,11 +465,265 @@ extern "C" __global__ void __raygen__rg()
         255u);
 }
 
-extern "C" __global__ void __raygen__photon()
+// Files a photon into a stochastic hash grid as __raygen__photon deposits it.
+//
+// These two grids have no build pass: the photon-tracing threads fill the
+// table themselves (Hachisuka & Jensen 2010), each bucket ending up with one
+// photon and a count of how many photons hashed there.  The cells and buckets
+// are exactly the full hash grid's.
+//
+// Stochastic, as published: the photon is written into its bucket and the
+// counter goes up, and whichever write lands last is the one kept.  That is
+// meant to be a uniform pick, but "last" is decided by the scheduler, not by
+// chance — a photon further along its path is deposited later, so long paths
+// win more than their share and the estimate leans towards them (Davidovič et
+// al. 2014, sec. 6.3, fig. 8a).  The write is also a plain copy of the whole
+// photon, so two threads filing into one bucket at once can leave behind a
+// photon stitched together from both.  Both flaws are kept on purpose: they
+// are the method, and they are what the rectified grid is measured against.
+//
+// Rectified: reservoir sampling.  Algorithm R (Vitter 1985) keeps the n-th
+// arrival with probability 1/n, which leaves every photon equally likely to be
+// the one kept, whatever order they came in.  Here each photon brings a random
+// 32-bit key and the bucket keeps the largest.  The n-th arrival beats the
+// n-1 before it with probability exactly 1/n, independently of how the others
+// fared (Rényi's record theorem), so this is Algorithm R's replacement rule —
+// but with the coins tossed before any photon arrives, so the arrival order
+// has nothing left to decide.  The key sits in the high half of a 64-bit word
+// and the photon's slot in the low half, so one atomicMax makes the decision
+// and records the winner together: no bucket can hold half of one photon and
+// half of another, because the photon itself stays whole at its own slot in
+// photon_map and the bucket only ever holds its index.
+__device__ __forceinline__ void insertStochastic(const Photon& ph, int slot,
+    unsigned int key)
+{
+    const PhotonGrid& g = params.grid;
+    const unsigned int bucket
+        = hashCell(photonCellCoord(ph.pos.x, g.aabb_min.x, g.cell_size),
+              photonCellCoord(ph.pos.y, g.aabb_min.y, g.cell_size),
+              photonCellCoord(ph.pos.z, g.aabb_min.z, g.cell_size))
+        & g.hash_mask;
+
+    if (params.accel == ACCEL_STOCHASTIC_HASH_GRID)
+        g.bucket_photon[bucket] = ph;
+    else
+        atomicMax(&g.bucket_pick[bucket],
+            ((unsigned long long)key << 32) | (unsigned int)slot);
+    atomicAdd(&g.bucket_count[bucket], 1);
+}
+
+// --mlrect-in-trace: the multi-level rectified grid's insertions of the photon
+// just stored at `slot`, done by the photon pass itself — the same cells,
+// hash, culling test and keys as multiLevelInsertKernel in cuda_passes.cu, so
+// with the same table size both fill exactly the same table.
+__device__ void insertMultiLevelRect(float3 p, int slot)
+{
+    const PhotonGrid& g = params.grid;
+    const float3 o = params.level_origin;
+    for (int j = 0; j < params.num_levels; ++j) {
+        const int l = params.levels[j];
+        const float cs = levelCellSize(params.level_s0, l);
+        const int cx = photonCellCoord(p.x, o.x, cs);
+        const int cy = photonCellCoord(p.y, o.y, cs);
+        const int cz = photonCellCoord(p.z, o.z, cs);
+        if (params.culling
+            && !cullMaskTest(params.cull_mask, params.cull_mask_bits, cx, cy, cz, l))
+            continue;
+        insertRepresentative(g.bucket_count, g.bucket_pick,
+            hashCell4(cx, cy, cz, l) & g.hash_mask, (unsigned int)slot, l,
+            params.frame_index, params.seed);
+    }
+}
+
+// Photon culling, the photon side: does `p` fall in a marked cell on any of
+// the levels this frame's lookups use?  See markLookupCellsKernel in
+// cuda_passes.cu for why a photon this turns away cannot contribute to any
+// lookup of the frame.
+__device__ bool photonInMarkedCell(float3 p)
+{
+    const float3 o = params.level_origin;
+    if (params.hier_mask) {
+        // Coarse to fine.  A mark of the photon's own cell keeps it; no mark
+        // and no parent mark either means no lookup on this level or a finer
+        // one marked a cell it lies in (they would all have marked this cell
+        // as a parent), and the coarser levels were tested already: cull.
+        // Exact, and it skips the finer levels' bits, so a collision there
+        // cannot keep the photon the way it can in the flat test below.
+        for (int j = params.num_levels - 1; j >= 0; --j) {
+            const int l = params.levels[j];
+            const float cs = levelCellSize(params.level_s0, l);
+            const int cx = photonCellCoord(p.x, o.x, cs);
+            const int cy = photonCellCoord(p.y, o.y, cs);
+            const int cz = photonCellCoord(p.z, o.z, cs);
+            if (cullMaskTest(params.cull_mask, params.cull_mask_bits, cx, cy, cz, l))
+                return true;
+            if (!cullMaskTest(params.cull_parent, params.cull_mask_bits, cx, cy, cz, l))
+                return false;
+        }
+        return false;
+    }
+    for (int j = 0; j < params.num_levels; ++j) {
+        const int l = params.levels[j];
+        const float cs = levelCellSize(params.level_s0, l);
+        if (cullMaskTest(params.cull_mask, params.cull_mask_bits,
+                photonCellCoord(p.x, o.x, cs), photonCellCoord(p.y, o.y, cs),
+                photonCellCoord(p.z, o.z, cs), l))
+            return true;
+    }
+    return false;
+}
+
+// Splatting (family C): a deposit goes straight into every visible point
+// whose sphere contains it, instead of into the photon map.  Returns the
+// number of pairs it made; `tested` gets the entries it looked at.
+//
+// Exact — every (photon, visible point) pair a gather would find is found
+// here, once:
+//   - if the photon lies within r_j of visible point j, it lies in one of the
+//     cells j was filed under on j's level (cellRange covers the sphere), so j
+//     has an entry in the bucket of the photon's own cell on that level;
+//   - the build left at most one entry per point and bucket (two of a point's
+//     cells can share a bucket), so j is met at most once on its level;
+//   - an entry of another level is skipped — j is met on its own level — and
+//     an entry of a point filed only under cells that collide into this
+//     bucket fails the distance test.
+// The test is photonUsable with the point's own radius in the distance and
+// plane tests and in the weight, exactly as the gathers apply it, in
+// arithmetic no compiler may rearrange (gather.h), and each channel gets the
+// same rounded product w * power the gathers add: the pairs and what they add
+// are the gathers', and only the order of the sums differs.
+__device__ __forceinline__ int splatDeposit(const Photon& ph, unsigned int photonId, int& tested)
+{
+    const VisiblePointGrid& g = params.vpgrid;
+    const float3 o = params.level_origin;
+    const size_t points = (size_t)params.width * params.height;
+    float* acc = params.splat_acc + (size_t)(photonId % (unsigned int)params.splat_stripes) * points * 3;
+    int pairs = 0;
+    for (int i = 0; i < g.num_levels; ++i) {
+        const int l = g.levels[i];
+        const float cs = vpCellSize(g, params.level_s0, l);
+        const unsigned int b = hashCell4(photonCellCoord(ph.pos.x, o.x, cs),
+                                   photonCellCoord(ph.pos.y, o.y, cs),
+                                   photonCellCoord(ph.pos.z, o.z, cs), l)
+            & g.hash_mask;
+        const int end = g.cell_start[b + 1];
+        tested += end - g.cell_start[b];
+        for (int e = g.cell_start[b]; e < end; ++e) {
+            const unsigned int v = g.values[e];
+            if ((int)(v >> LEVEL_SHIFT) != l)
+                continue; // an entry of another level that collided into b
+            const unsigned int j = v & LEVEL_INDEX_MASK;
+            if (g.points) {
+                // --inline-positions: the distance first, from the point's
+                // position and radius next to the entry — photonUsable's own
+                // arithmetic, so it turns away exactly what photonUsable
+                // would — and the gather point itself only within its radius.
+                const float4 q = g.points[e];
+                const float3 diff = subRn(ph.pos, make_float3(q.x, q.y, q.z));
+                if (dotRn(diff, diff) > q.w * q.w)
+                    continue;
+            }
+            const GatherPoint& gp = params.gather_points[j];
+            const float r = gp.r;
+            float d2;
+            if (!photonUsable(ph, gp.pos, gp.normal, r * r, params.photon_plane_tol * r,
+                    params.photon_normal_tol, gp.max_photon_depth, d2))
+                continue;
+            const float w = coneWeight(d2, 1.f / r);
+            float* a = acc + (size_t)j * 3;
+            atomicAdd(a + 0, __fmul_rn(w, ph.power.x));
+            atomicAdd(a + 1, __fmul_rn(w, ph.power.y));
+            atomicAdd(a + 2, __fmul_rn(w, ph.power.z));
+            ++pairs;
+        }
+    }
+    return pairs;
+}
+
+// Stochastic splatting: the same scan as splatDeposit, but of the m points
+// the deposit reaches only one gets anything — picked uniformly by reservoir
+// sampling, the k-th one replacing the kept one with probability 1/k — and
+// it gets m times its own share, m * w * power.  Every point the deposit
+// reaches is the one kept with probability 1/m, so each receives w * power
+// in expectation, exactly what splatDeposit adds: unbiased, with one atomic
+// triple per deposit instead of m.  The picks come from a stream of their own,
+// seeded by (photon, bounce, frame, seed), so the photon's path draws exactly
+// the random numbers it draws in the other modes.
+__device__ __forceinline__ int stochSplatDeposit(const Photon& ph, unsigned int photonId, int depth,
+    int& tested)
+{
+    const VisiblePointGrid& g = params.vpgrid;
+    const float3 o = params.level_origin;
+    const size_t points = (size_t)params.width * params.height;
+    unsigned int rng = hashSeed3((photonId << 5) | (unsigned int)depth, (unsigned int)params.frame_index,
+        (unsigned int)params.seed ^ RNG_STREAM_STOCHSPLAT);
+    int m = 0;
+    unsigned int kept = 0;
+    float keptW = 0.f;
+    for (int i = 0; i < g.num_levels; ++i) {
+        const int l = g.levels[i];
+        const float cs = vpCellSize(g, params.level_s0, l);
+        const unsigned int b = hashCell4(photonCellCoord(ph.pos.x, o.x, cs),
+                                   photonCellCoord(ph.pos.y, o.y, cs),
+                                   photonCellCoord(ph.pos.z, o.z, cs), l)
+            & g.hash_mask;
+        const int end = g.cell_start[b + 1];
+        tested += end - g.cell_start[b];
+        for (int e = g.cell_start[b]; e < end; ++e) {
+            const unsigned int v = g.values[e];
+            if ((int)(v >> LEVEL_SHIFT) != l)
+                continue;
+            const unsigned int j = v & LEVEL_INDEX_MASK;
+            if (g.points) {
+                const float4 q = g.points[e];
+                const float3 diff = subRn(ph.pos, make_float3(q.x, q.y, q.z));
+                if (dotRn(diff, diff) > q.w * q.w)
+                    continue;
+            }
+            const GatherPoint& gp = params.gather_points[j];
+            const float r = gp.r;
+            float d2;
+            if (!photonUsable(ph, gp.pos, gp.normal, r * r, params.photon_plane_tol * r,
+                    params.photon_normal_tol, gp.max_photon_depth, d2))
+                continue;
+            ++m;
+            if (randf(rng) * (float)m < 1.f) {
+                kept = j;
+                keptW = coneWeight(d2, 1.f / r);
+            }
+        }
+    }
+    if (m > 0) {
+        float* a = params.splat_acc
+            + ((size_t)(photonId % (unsigned int)params.splat_stripes) * points + kept) * 3;
+        const float mw = __fmul_rn((float)m, keptW);
+        atomicAdd(a + 0, __fmul_rn(mw, ph.power.x));
+        atomicAdd(a + 1, __fmul_rn(mw, ph.power.y));
+        atomicAdd(a + 2, __fmul_rn(mw, ph.power.z));
+    }
+    return m;
+}
+
+// What the photon pass does with a deposit: store it in the photon map (the
+// gathering families A and B), or splat it into the visible points (C) —
+// into all of them it reaches, or into one picked at random.  One walk for
+// all, so that all trace exactly the same paths with exactly the same random
+// numbers; they are separate programs in separate pipelines, so that the
+// splatting code costs the storing pass no registers.
+enum PhotonPassMode : int {
+    PHOTONS_STORE = 0,
+    PHOTONS_SPLAT = 1,
+    PHOTONS_STOCHSPLAT = 2
+};
+
+template <int MODE>
+__device__ __forceinline__ void tracePhotonPath()
 {
     const unsigned int photon_id = optixGetLaunchIndex().x;
     unsigned int rng = hashSeed3(photon_id, (unsigned int)params.frame_index,
         (unsigned int)params.seed ^ RNG_STREAM_PHOTON);
+    unsigned int keyRng = hashSeed3(photon_id, (unsigned int)params.frame_index,
+        (unsigned int)params.seed ^ RNG_STREAM_RESERVOIR);
 
     const bool hasEnv = (params.emit_sky_photons != 0)
         && (params.sky_intensity > 0.f)
@@ -790,6 +776,13 @@ extern "C" __global__ void __raygen__photon()
 
     power = power * params.photon_power_scale;
 
+    // Culling and splatting statistics, counted per path and added once at
+    // the end.
+    int deposits = 0;
+    int kept = 0;
+    int reached = 0; // splatting: deposits that made at least one pair
+    int pairs = 0;
+
     for (int depth = 0; depth < params.max_depth; depth++) {
         // Payload: same as CH layout
         unsigned int p0 = 0u, p1 = 0u, p2 = 0u; // radiance (unused here)
@@ -840,16 +833,55 @@ extern "C" __global__ void __raygen__photon()
             // part of the image to the density estimate.  Everything past the
             // first bounce — indirect light and caustics through L S+ D — is
             // what the map is for.
-            if (depth > 0 || params.store_direct_photons) {
-                int slot = atomicAdd(params.photon_count, 1);
-                if (slot < params.photon_capacity) {
-                    Photon ph;
-                    ph.pos = hitpos;
-                    ph.power = power;
-                    ph.dir = -dir;
-                    ph.normal = n;
-                    ph.depth = depth;
-                    params.photon_map[slot] = ph;
+            if (MODE != PHOTONS_STORE && (depth > 0 || params.store_direct_photons)) {
+                // Splatting: nothing is stored, and the path below bounces on
+                // exactly as it would have after a store.
+                ++deposits;
+                Photon ph;
+                ph.pos = hitpos;
+                ph.power = power;
+                ph.dir = -dir;
+                ph.normal = n;
+                ph.depth = depth;
+                int tested = 0;
+                const int made = (MODE == PHOTONS_SPLAT) ? splatDeposit(ph, photon_id, tested)
+                                                         : stochSplatDeposit(ph, photon_id, depth, tested);
+                pairs += made;
+                reached += made > 0 ? 1 : 0;
+                // --stats: one slot per deposit.
+                if (params.stats) {
+                    const int slot = atomicAdd(params.stat_slot, 1);
+                    if (slot < params.stat_capacity) {
+                        params.stat_tested[slot] = tested;
+                        params.stat_accepted[slot] = made;
+                    }
+                }
+            } else if (MODE == PHOTONS_STORE && (depth > 0 || params.store_direct_photons)) {
+                // Drawn for every deposit, kept or not, so that culling leaves
+                // the keys of the photons it does keep where they were.
+                const unsigned int key
+                    = isStochasticHashGrid(params.accel) ? pcg(keyRng) : 0u;
+
+                // Culling skips the store and nothing else: the path below
+                // bounces on, drawing the same random numbers, whether or not
+                // this photon was kept.
+                ++deposits;
+                if (!params.culling || photonInMarkedCell(hitpos)) {
+                    ++kept;
+                    int slot = atomicAdd(params.photon_count, 1);
+                    if (slot < params.photon_capacity) {
+                        Photon ph;
+                        ph.pos = hitpos;
+                        ph.power = power;
+                        ph.dir = -dir;
+                        ph.normal = n;
+                        ph.depth = depth;
+                        params.photon_map[slot] = ph;
+                        if (isStochasticHashGrid(params.accel))
+                            insertStochastic(ph, slot, key);
+                        else if (params.accel == ACCEL_MLRECT && params.mlrect_in_trace)
+                            insertMultiLevelRect(hitpos, slot);
+                    }
                 }
             }
 
@@ -883,6 +915,36 @@ extern "C" __global__ void __raygen__photon()
             origin = hitpos + params.scene_epsilon * dir;
         }
     }
+
+    // A few atomics per path rather than one per deposit.
+    if (MODE == PHOTONS_STORE && params.culling && deposits > 0) {
+        atomicAdd(&params.deposit_counts[0], deposits);
+        atomicAdd(&params.deposit_counts[1], kept);
+    }
+    if (MODE != PHOTONS_STORE && deposits > 0) {
+        atomicAdd(&params.splat_counts[0], (unsigned long long)deposits);
+        atomicAdd(&params.splat_counts[1], (unsigned long long)reached);
+        atomicAdd(&params.splat_counts[2], (unsigned long long)pairs);
+    }
+}
+
+// The photon pass of the gathering families: deposits go into the photon map.
+extern "C" __global__ void __raygen__photon()
+{
+    tracePhotonPath<PHOTONS_STORE>();
+}
+
+// The photon pass of splatting: deposits go into the visible points.  A
+// pipeline of its own (see createPipelines in main.cpp).
+extern "C" __global__ void __raygen__photon_splat()
+{
+    tracePhotonPath<PHOTONS_SPLAT>();
+}
+
+// ... and of stochastic splatting, a pipeline of its own as well.
+extern "C" __global__ void __raygen__photon_stochsplat()
+{
+    tracePhotonPath<PHOTONS_STOCHSPLAT>();
 }
 
 // Pass 1 of the gather: walk the camera path and park it at the first diffuse
@@ -892,10 +954,12 @@ extern "C" __global__ void __raygen__photon()
 //
 // Exactly one camera sample per pixel: see the note on Params::samples_per_pixel
 // for why photon mapping spends extra budget on frames instead.
-extern "C" __global__ void __raygen__camera()
+//
+// The walk itself is cameraWalk, which the fused camera-and-gather programs
+// (--fused) run too: the same walk with the same random numbers, so they park
+// every pixel at exactly the gather point this pass writes.
+__device__ __forceinline__ GatherPoint cameraWalk(uint3 idx, int pixel)
 {
-    const uint3 idx = optixGetLaunchIndex();
-    const int pixel = idx.y * params.width + idx.x;
     unsigned int rng = hashSeed3(pixel, (unsigned int)params.frame_index,
         (unsigned int)params.seed ^ RNG_STREAM_GATHER);
 
@@ -906,6 +970,9 @@ extern "C" __global__ void __raygen__camera()
     gp.direct = make_float3(0.f, 0.f, 0.f);
     gp.max_photon_depth = 0;
     gp.valid = 0;
+    gp.r = 0.f;
+    gp.level = 0;
+    gp.t = 0.f;
 
     float pu = (idx.x + randf(rng)) / params.width;
     float pv = (idx.y + randf(rng)) / params.height;
@@ -917,6 +984,7 @@ extern "C" __global__ void __raygen__camera()
 
     float3 result = make_float3(0.f, 0.f, 0.f);
     float3 path_throughput = make_float3(1.f, 1.f, 1.f);
+    float pathLength = 0.f; // eye to the current vertex, along the path
 
     for (int depth = 0; depth < params.max_depth; depth++) {
 
@@ -966,6 +1034,10 @@ extern "C" __global__ void __raygen__camera()
             __uint_as_float(p4),
             __uint_as_float(p5));
 
+        // Every segment counts, the ones through mirrors and glass included:
+        // the pixel's cone keeps widening along all of them.
+        pathLength += length(hitpos - origin);
+
         // Emission from light source (CH wrote to p0-p2 with throughput=1)
         float3 emission = make_float3(__uint_as_float(p0),
             __uint_as_float(p1),
@@ -1004,6 +1076,19 @@ extern "C" __global__ void __raygen__camera()
             // photon mapping quietly integrates far longer paths.
             gp.max_photon_depth = params.max_depth - 1 - depth;
             gp.valid = 1;
+
+            // The radius this pixel's lookup will use, and the cell level
+            // its search runs on.  In footprint mode it is k_pix pixels'
+            // worth of surface at the end of this path; see
+            // Params::radius_mode.
+            gp.t = pathLength;
+            float r = params.gather_radius;
+            if (params.radius_mode == RADIUS_FOOTPRINT) {
+                r = params.radius_scale * params.k_pix * pathLength * params.pixel_angle;
+                r = fminf(fmaxf(r, params.radius_min), params.radius_max);
+            }
+            gp.r = r;
+            gp.level = levelOf(r, params.level_s0);
             break; // PM: only first diffuse bounce
 
         } else if (matType == MAT_MIRROR) {
@@ -1036,35 +1121,77 @@ extern "C" __global__ void __raygen__camera()
     }
 
     gp.direct = result;
-
-    params.gather_points[pixel] = gp;
+    return gp;
 }
 
-// Pass 2 of the gather: the photon lookup, and nothing else.
-//
-// This is the launch the acceleration structures are compared on, so it is kept
-// deliberately bare — read the gather point, ask the photon map for irradiance,
-// write the pixel's radiance.  Accumulation and tone mapping happen afterwards
-// in a plain CUDA kernel so that they stay out of the measurement, and so that
-// this pass can be run twice over one photon map (grid against brute force)
-// without the two runs accumulating on top of each other.
-extern "C" __global__ void __raygen__query()
+extern "C" __global__ void __raygen__camera()
 {
     const uint3 idx = optixGetLaunchIndex();
     const int pixel = idx.y * params.width + idx.x;
+    const GatherPoint gp = cameraWalk(idx, pixel);
 
-    const GatherPoint gp = params.gather_points[pixel];
-    float3 radiance = gp.direct;
+    params.gather_points[pixel] = gp;
 
-    if (gp.valid) {
-        float usedRadius;
-        float3 irradiance = photonIrradiance(gp.pos, gp.normal,
-            gp.max_photon_depth, usedRadius);
-        radiance += gp.weight * irradiance;
-    }
-
-    params.query_radiance[pixel] = radiance;
+    // Invalid gather points never look anything up, so they use no level.
+    // A plain store of the constant 1: every writer writes the same value, so
+    // no atomic is needed, and reading first spares the millions of pixels
+    // that share a level a write each.  With culling, the cells to keep are
+    // marked afterwards, by the mark pass, from the gather points written
+    // above.
+    if (gp.valid && params.used_levels && !params.used_levels[gp.level])
+        params.used_levels[gp.level] = 1;
 }
+
+// --fused (family A): the camera walk and the photon lookup in one program,
+// with no gather point stored in between.  The structure was built before
+// this frame's radii were known — its cell size or levels come from the frame
+// before (see renderOffline) — so a lookup may meet cells narrower than its
+// radius, or find its own level not built: the range search is exact for any
+// cell size (cellRange; the single-level hash grid walks it with cell checks,
+// ANYSIZE), and a level not built is replaced by the nearest one that is.
+// The frame's largest radius and the levels its lookups wanted are recorded
+// for the next frame.
+__device__ __forceinline__ int nearestBuiltLevel(int level)
+{
+    int best = params.num_levels > 0 ? params.levels[0] : level;
+    for (int i = 1; i < params.num_levels; ++i) {
+        const int l = params.levels[i];
+        if (abs(l - level) < abs(best - level) || (abs(l - level) == abs(best - level) && l > best))
+            best = l;
+    }
+    return best;
+}
+
+template <int ACCEL>
+__device__ __forceinline__ void fusedCameraGather()
+{
+    const uint3 idx = optixGetLaunchIndex();
+    const int pixel = idx.y * params.width + idx.x;
+    const GatherPoint gp = cameraWalk(idx, pixel);
+
+    float3 radiance = gp.direct;
+    if (gp.valid) {
+        const int level = isMultiLevelGrid(ACCEL) ? nearestBuiltLevel(gp.level) : gp.level;
+        GatherTally tally = { 0, 0, 0 };
+        float usedRadius;
+        const float3 irradiance = photonIrradiance<ACCEL, false, true>(params, gp.pos, gp.normal,
+            gp.max_photon_depth, gp.r, level, usedRadius, tally);
+        radiance += gp.weight * irradiance;
+        if (!params.used_levels[gp.level])
+            params.used_levels[gp.level] = 1;
+        // r >= 0, so its bits order like its values.
+        atomicMax(params.fused_max_r, __float_as_uint(gp.r));
+    }
+    params.query_radiance[pixel] = radiance;
+    if (params.fused_store_points)
+        params.gather_points[pixel] = gp;
+}
+
+extern "C" __global__ void __raygen__fused_uniform() { fusedCameraGather<ACCEL_UNIFORM_GRID>(); }
+extern "C" __global__ void __raygen__fused_hash() { fusedCameraGather<ACCEL_HASH_GRID>(); }
+extern "C" __global__ void __raygen__fused_rect() { fusedCameraGather<ACCEL_RECTIFIED_HASH_GRID>(); }
+extern "C" __global__ void __raygen__fused_mlhash() { fusedCameraGather<ACCEL_MLHASH>(); }
+extern "C" __global__ void __raygen__fused_mlrect() { fusedCameraGather<ACCEL_MLRECT>(); }
 
 // Closesthit — geometry + emission only, NO BxDF logic
 extern "C" __global__ void __closesthit__ch()

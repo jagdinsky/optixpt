@@ -47,6 +47,10 @@ add_executable(renderer src/main.cpp src/cuda_passes.cu)
 # device_ptx has to stay a single-architecture PTX blob.
 set_target_properties(renderer PROPERTIES CUDA_ARCHITECTURES native)
 
+# The build type goes into every timing record: a Debug host build measures
+# something else than a Release one.
+target_compile_definitions(renderer PRIVATE RENDERER_BUILD_TYPE="$<CONFIG>")
+
 target_include_directories(renderer PRIVATE
     ${OptiX_INCLUDE}
     ${CMAKE_SOURCE_DIR}/src

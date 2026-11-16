@@ -2,3 +2,6 @@ build/
 __pycache__/
 *.pyc
 box_*/
+eval/runs/
+eval/refs/
+build-release/
