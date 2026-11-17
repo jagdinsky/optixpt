@@ -5,11 +5,14 @@
         --configs A/hash/global B/mlhash/footprint B/mlrect/footprint \\
         --k-pix 2,4,8 --seeds 1,2,3 --frames 1024
 
-A configuration is <family>/<accel>/<radius mode> as the renderer names it
-(A: gather, B: gather from a culled map, C: splatting), or PT for path tracing
-with 4 samples per pixel per frame.  Footprint configurations run once per
---k-pix value, or per the values after an @ (C/mlsplat/footprint@4); global
-ones ignore it.
+A configuration is <family>/<accel>/<radius mode>[+variant...] as the renderer
+names it (A: gather, B: gather from a culled map, C: splatting, D: the
+adaptive LoD hash-grid SPPM, E: RTPM; see evalio.py for the variants, e.g.
+B/hash/footprint+hier, D/sppm_lepski/footprint+kappa2, E/rtpm/global+cull),
+or PT for path tracing with 4 samples per pixel per frame.  Footprint
+configurations run once per --k-pix value, or per the values after an @
+(C/mlsplat/footprint@4), or at the one their label names (+kpix8); global
+ones ignore it.  For family D, k_pix is the radius of its largest scale.
 
 With --render, every run that is not there yet is rendered, with checkpoints
 at every power of two of frames, into
@@ -63,23 +66,24 @@ SLOTS = (("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"),
 
 
 def config_args(config):
-    """Renderer options of a configuration name."""
+    """Renderer options of a configuration name (evalio.config_options)."""
     if config.upper() == "PT":
         return []
-    try:
-        family, accel, mode = config.split("/")
-    except ValueError:
-        sys.exit("configuration %r is not <family>/<accel>/<radius mode>" % config)
-    if family not in ("A", "B", "C") or mode not in ("global", "footprint"):
-        sys.exit("configuration %r: family A, B or C, radius mode global or footprint" % config)
-    args = ["--photon", "--accel", accel, "--radius-mode", mode]
-    if family != "C":
-        args += ["--culling", "on" if family == "B" else "off"]
-    return args
+    return ["--photon"] + evalio.config_options(config)
+
+
+def k_pix_values(config, ks):
+    """The k_pix values a configuration runs at: the given ones for a
+    footprint configuration, none (the renderer's own, or the label's +kpixN)
+    otherwise."""
+    if config.upper() == "PT":
+        return [None]
+    footprint = evalio.split_config(config)[2] == "footprint"
+    return ks if footprint and not evalio.has_variant(config, "kpix") else [None]
 
 
 def run_name(config, k, args, seed):
-    tag = "pt" if config.upper() == "PT" else config.replace("/", "_")
+    tag = "pt" if config.upper() == "PT" else config.replace("/", "_").replace("+", "_")
     if k is not None:
         tag += "_k%g" % k
     # --extra changes the run, so it is part of the name too
@@ -269,8 +273,7 @@ def main():
         config_ks[config] = [float(k) for k in own.split(",")] if own else ks
     args.configs = configs
     for config in args.configs:
-        footprint = config.endswith("/footprint")
-        for k in (config_ks[config] if footprint else [None]):
+        for k in k_pix_values(config, config_ks[config]):
             for seed in seeds:
                 name = run_name(config, k, args, seed)
                 stem = os.path.join(out_dir, name)
@@ -280,10 +283,13 @@ def main():
                         print("missing %s (use --render)" % name)
                         continue
                     print("render %s" % name, flush=True)
-                    extra = config_args(config) + (["--k-pix", k] if k is not None else [])
+                    # The configuration's own options last: a variant may
+                    # override what is common to the runs (+paths300000).
+                    extra = []
                     if config.upper() != "PT":
                         extra += ["--paths", args.paths, "--timing-json", stem + ".timing.json",
                                   "--warmup", 0] + args.extra.split()
+                    extra += config_args(config) + (["--k-pix", k] if k is not None else [])
                     evalio.run_renderer([glb, "--offline", "--camera", cam, "--res", args.res[0],
                                          args.res[1], "--frames", args.frames, "--depth", args.depth,
                                          "--seed", seed, "--checkpoints", "--output", stem + ".exr"]

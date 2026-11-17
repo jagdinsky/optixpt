@@ -81,7 +81,16 @@ enum AccelType : int {
     // visible points it lies within (see VisiblePointGrid).
     ACCEL_SPLAT = 7, // visible points in one hash grid, cells F x the largest radius
     ACCEL_MLSPLAT = 8, // visible points each on the level that fits F x its radius
-    ACCEL_STOCHSPLAT = 9 // mlsplat's grid, each deposit adding to one point it reaches
+    ACCEL_STOCHSPLAT = 9, // mlsplat's grid, each deposit adding to one point it reaches
+    // Adaptive LoD hash-grid SPPM (family D): a method of its own, with its
+    // own programs, kernels and buffers (sppm_lepski.h).  Only the name lives
+    // here; nothing in the other families' code branches on it.
+    ACCEL_SPPM_LEPSKI = 10,
+    // RTPM (family E): the photons in an acceleration structure, gathered by
+    // an infinitely short ray (Kern et al. 2023).  It gathers at the camera
+    // pass's gather points like the structures above, but its photon pass,
+    // structures and collection pass are its own (rtpm.h).
+    ACCEL_RTPM = 11
 };
 
 // The grids that file every photon once per cell level in use, so that each

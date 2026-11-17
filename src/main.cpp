@@ -1,5 +1,7 @@
 #include "cuda_passes.h"
 #include "params.h"
+#include "rtpm.h"
+#include "sppm_lepski.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <optix.h>
@@ -431,6 +433,11 @@ struct RunArgs {
     // Optional, family A: the camera walk and the lookup in one program, the
     // structure built first from the previous frame's radii and levels.
     bool fused = false;
+
+    // The adaptive LoD hash-grid SPPM's own options (--lepski-*).
+    LepskiOptions lepski;
+    // RTPM's own options (--rtpm-*).
+    RtpmOptions rtpm;
 };
 
 // "4,8,16", "1-64" or "1-1024:16" (every 16th frame from 1), and any
@@ -609,6 +616,10 @@ static RunArgs parseArgs(int argc, char** argv) {
                 std::cerr << "--splat-stripes expects 1..64\n";
                 std::exit(2);
             }
+        } else if (lepskiParseOption(args.lepski, argc, argv, i)) {
+            // one of --lepski-*
+        } else if (rtpmParseOption(args.rtpm, argc, argv, i)) {
+            // one of --rtpm-*
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "Unknown option: " << a << "\n"
                       << "If this option was added recently, the binary is out "
@@ -1869,6 +1880,10 @@ static const char* accelName(AccelType a)
         return "mlsplat";
     case ACCEL_STOCHSPLAT:
         return "stochsplat";
+    case ACCEL_SPPM_LEPSKI:
+        return "sppm_lepski";
+    case ACCEL_RTPM:
+        return "rtpm";
     default:
         return "uniform";
     }
@@ -1895,6 +1910,10 @@ static const char* accelLabel(AccelType a)
         return "splatting into a multi-level hash grid of visible points";
     case ACCEL_STOCHSPLAT:
         return "stochastic splatting into one of the visible points reached";
+    case ACCEL_SPPM_LEPSKI:
+        return "adaptive LoD hash-grid SPPM";
+    case ACCEL_RTPM:
+        return "RTPM: photon acceleration structures, collected by ray";
     default:
         return "uniform grid";
     }
@@ -1912,9 +1931,15 @@ static bool estimatesOnly(AccelType a)
 // reports: family A gathers from the full photon map, family B from a map
 // culled to what the frame's lookups can reach, family C splats the photons
 // into the visible points (culled implicitly: only photons that reach one
-// count).  E.g. B/mlhash/footprint, C/mlsplat/footprint.
+// count).  E.g. B/mlhash/footprint, C/mlsplat/footprint.  Family D is the
+// adaptive LoD hash-grid SPPM, a method of its own: D/sppm_lepski/footprint.
+// Family E is RTPM, the photons in acceleration structures: E/rtpm/global.
 static const char* familyName(AccelType a, bool culling)
 {
+    if (a == ACCEL_SPPM_LEPSKI)
+        return "D";
+    if (a == ACCEL_RTPM)
+        return "E";
     return isSplatting(a) ? "C" : (culling ? "B" : "A");
 }
 
@@ -1946,6 +1971,10 @@ static bool parseAccel(const std::string& s, AccelType& out)
         out = ACCEL_MLSPLAT;
     } else if (s == "stochsplat") {
         out = ACCEL_STOCHSPLAT;
+    } else if (s == "sppm_lepski" || s == "lepski") {
+        out = ACCEL_SPPM_LEPSKI;
+    } else if (s == "rtpm") {
+        out = ACCEL_RTPM;
     } else {
         return false;
     }
@@ -2242,9 +2271,11 @@ float launchCameraPass(RendererState& state, Params& p, CUstream& stream,
     // Everyone else gets the radii reduced for the statistics only (always in
     // footprint mode, with --stats in global mode too), after the pass's time
     // is taken.
+    // RTPM too: its photon boxes are as wide as the largest radius.
     const bool needMaxRadius = footprint
         && (gAccel == ACCEL_UNIFORM_GRID || gAccel == ACCEL_HASH_GRID
-            || isStochasticHashGrid(gAccel) || gAccel == ACCEL_SPLAT || gFused);
+            || isStochasticHashGrid(gAccel) || gAccel == ACCEL_SPLAT || gFused
+            || gAccel == ACCEL_RTPM);
     const bool wantRadii = footprint || p.stats;
 
     GatherRadiusStats radii;
@@ -2697,6 +2728,13 @@ static void reportTimings(const std::vector<FrameTimings>& timings,
               << gEnv.driver << "\n";
 }
 
+// The adaptive LoD hash-grid SPPM's part of the record (sppm_lepski_host.h).
+static void lepskiWriteJson(std::ostream& out);
+static bool lepskiCullingOn();
+// ... and RTPM's (rtpm_host.h).
+static void rtpmWriteJson(std::ostream& out);
+static bool rtpmCullingOn();
+
 // The same numbers as JSON, one record per frame, for whatever plots the
 // comparison ends up needing.  Written by hand rather than through a library
 // because it is a dozen fields and the file is an output, not an interface.
@@ -2749,11 +2787,21 @@ static void writeTimingJson(const std::string& path,
     out << "  \"photon_paths\": " << p.num_photon_paths << ",\n";
     out << "  \"seed\": " << p.seed << ",\n";
     // Splatting culls implicitly: a photon that reaches no visible point adds nothing.
-    out << "  \"culling\": " << (isSplatting(gAccel) ? "\"implicit\"" : (gCulling ? "true" : "false")) << ",\n";
+    // ... and the adaptive LoD hash-grid SPPM with a bitset of its own.
+    if (gAccel == ACCEL_SPPM_LEPSKI)
+        out << "  \"culling\": " << (lepskiCullingOn() ? "\"bitset\"" : "false") << ",\n";
+    else if (gAccel == ACCEL_RTPM) // ... and RTPM with the paper's mask
+        out << "  \"culling\": " << (rtpmCullingOn() ? "\"mask\"" : "false") << ",\n";
+    else
+        out << "  \"culling\": " << (isSplatting(gAccel) ? "\"implicit\"" : (gCulling ? "true" : "false")) << ",\n";
     out << "  \"mask_bits\": " << p.cull_mask_bits << ",\n";
     out << "  \"radius_mode\": \"" << (p.radius_mode == RADIUS_FOOTPRINT ? "footprint" : "global") << "\",\n";
     out << "  \"k_pix\": " << p.k_pix << ",\n";
     out << "  \"s0\": " << p.level_s0 << ",\n";
+    if (gAccel == ACCEL_SPPM_LEPSKI)
+        lepskiWriteJson(out);
+    if (gAccel == ACCEL_RTPM)
+        rtpmWriteJson(out);
     out << "  \"per_frame\": [\n";
     for (size_t i = 0; i < timings.size(); ++i) {
         const FrameTimings& t = timings[i];
@@ -2931,6 +2979,11 @@ static void writeGatherDebugImages(const std::string& prefix, const Params& p,
     std::cout << "[Debug] " << prefix << ".rpx.exr and .level.exr, last frame: k_pix "
               << p.k_pix << ", radius scale " << p.radius_scale << "\n";
 }
+
+// The adaptive LoD hash-grid SPPM's host side (--accel sppm_lepski).
+#include "sppm_lepski_host.h"
+// RTPM's host side (--accel rtpm).
+#include "rtpm_host.h"
 
 static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
     const std::string& outputFile)
@@ -3122,13 +3175,30 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
             // no pixel.
             // --fused: after the first frame, the structure first and then the
             // camera walk and lookup in one pass.
+            // The adaptive LoD hash-grid SPPM is a frame of its own: four
+            // stages, its own buffers, and it writes the image itself.
+            const bool lepskiFrame = gAccel == ACCEL_SPPM_LEPSKI;
             const bool fusedFrame = gFused && fusedHist.valid;
-            if (fusedFrame)
+            if (lepskiFrame) {
+                GatherVerification v;
+                launchLepskiFrame(state, p, stream, &ft, f == 0, verifyGather ? &v : nullptr);
+                if (verifyGather) {
+                    if (!v.ok)
+                        ++verifyFailures;
+                    std::cout << "\r[Verify] frame " << f << (v.ok ? "  OK  " : "  FAIL")
+                              << "  sppm_lepski, grid over the culled map vs brute force over"
+                                 " the full one: max abs diff = " << v.max_abs
+                              << "  max rel = " << v.max_rel
+                              << "  pixels off = " << v.differing_pixels << "\n";
+                }
+            } else if (fusedFrame)
                 launchFusedFrame(state, p, stream, &ft, fusedHist);
             else
                 ft.camera = launchCameraPass(state, p, stream, &ft);
 
-            if (fusedFrame) {
+            if (lepskiFrame) {
+                // nothing left to launch
+            } else if (fusedFrame) {
                 if (verifyGather) {
                     // The fused frame stored its gather points; the lookup
                     // again over them, brute force, must agree.
@@ -3151,6 +3221,22 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
                     std::cout << "\r[Verify] frame " << f << (v.ok ? "  OK  " : "  FAIL")
                               << "  fused-" << accelName(gAccel) << " vs brute: max abs diff = "
                               << v.max_abs << "  max rel = " << v.max_rel
+                              << "  pixels off = " << v.differing_pixels << "\n";
+                }
+            } else if (gAccel == ACCEL_RTPM) {
+                // Family E: at the gather points the camera pass just left,
+                // RTPM's own passes — the culling mask, the photon
+                // generation, the photon structures, the collection — which
+                // leave the frame's radiance where a query pass would.
+                GatherVerification v;
+                launchRtpmPasses(state, p, stream, &ft, verifyGather ? &v : nullptr);
+                if (verifyGather) {
+                    if (!v.ok)
+                        ++verifyFailures;
+                    std::cout << "\r[Verify] frame " << f << (v.ok ? "  OK  " : "  FAIL")
+                              << "  rtpm, structures over the culled maps vs brute force over"
+                                 " the full ones: max abs diff = " << v.max_abs
+                              << "  max rel = " << v.max_rel
                               << "  pixels off = " << v.differing_pixels << "\n";
                 }
             } else if (isSplatting(gAccel)) {
@@ -3255,7 +3341,8 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
                 summarizeQueryStats(p.stat_cells, W * H, state.grid, stream, ft.cells_visited);
             }
 
-            ft.accum = launchAccumulatePass(p, stream);
+            if (!lepskiFrame)
+                ft.accum = launchAccumulatePass(p, stream);
             timings.push_back(ft);
             gpuMs += ft.total();
 
@@ -3301,8 +3388,14 @@ static bool renderOffline(RendererState& state, Params& p, const RunArgs& args,
     std::cout << "\n";
 
     reportTimings(timings, args, p);
+    if (gAccel == ACCEL_SPPM_LEPSKI && p.render_mode == 1)
+        lepskiReport(p);
+    if (gAccel == ACCEL_RTPM && p.render_mode == 1)
+        rtpmReport();
     writeTimingJson(args.timingJson, timings, args, p);
-    if (!args.debugExr.empty() && p.render_mode == 1)
+    // (the adaptive LoD hash-grid SPPM keeps gather points of its own; its
+    // debug images are the views of --lepski-view)
+    if (!args.debugExr.empty() && p.render_mode == 1 && gAccel != ACCEL_SPPM_LEPSKI)
         writeGatherDebugImages(args.debugExr, p, W, H);
     if (!args.debugExr.empty() && p.stats) {
         // Photons accepted by each lookup of the last frame (-1: no lookup).
@@ -3658,7 +3751,8 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             const char* accelItems[] = { "Brute force", "Uniform grid", "Hash grid",
                 "Stochastic hash grid", "Rectified stochastic hash grid",
                 "Multi-level hash grid", "Multi-level rectified hash grid",
-                "Splatting (single level)", "Splatting (multi-level)", "Stochastic splatting" };
+                "Splatting (single level)", "Splatting (multi-level)", "Stochastic splatting",
+                "Adaptive LoD hash-grid SPPM (Lepski)", "RTPM (photon BVH, Kern et al. 2023)" };
             int accelIndex = (int)gAccel;
             if (ImGui::Combo("Acceleration structure", &accelIndex, accelItems,
                     IM_ARRAYSIZE(accelItems))) {
@@ -3666,11 +3760,29 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
                 // Splatting fixes the radii before the photons: no adaptive one.
                 if (isSplatting(gAccel))
                     p.adaptive_radius = 0;
+                // The adaptive LoD hash-grid SPPM's buffers go when another
+                // structure is chosen, and come back if it is chosen again.
+                if (gAccel != ACCEL_SPPM_LEPSKI)
+                    lepskiFree(gLepski.buffers);
+                // ... and so do RTPM's.  It has no adaptive radius either:
+                // its boxes are built before any photon is counted.
+                if (gAccel != ACCEL_RTPM)
+                    rtpmRelease();
+                else
+                    p.adaptive_radius = 0;
                 resetAccum = true;
                 resetPhotons = true; // the structure is built by the photon pass
             }
             if (isSplatting(gAccel))
                 ImGui::TextDisabled("  culling implicit: only photons reaching a visible point count");
+            // The adaptive LoD hash-grid SPPM's own controls (sppm_lepski_host.h).
+            if (gAccel == ACCEL_SPPM_LEPSKI)
+                lepskiGui(lastFrame);
+            // RTPM's own controls (rtpm_host.h); each changes the estimate.
+            if (gAccel == ACCEL_RTPM && rtpmGui(lastFrame)) {
+                resetAccum = true;
+                resetPhotons = true;
+            }
         }
 
         if (p.render_mode == 2 && ImGui::CollapsingHeader("Photon visualisation", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -3798,7 +3910,25 @@ bool renderRealtime(const CameraFileState& cam, RendererState& state, Params& p)
             //
             // Splatting keeps no map at all: every frame splats a fresh photon
             // pass into that frame's visible points.
-            if (p.render_mode == 1 && isSplatting(gAccel)) {
+            //
+            // The adaptive LoD hash-grid SPPM is an iteration of its own; a
+            // frame index of 0 — the camera moved, or a setting changed —
+            // restarts its running estimate.
+            if (p.render_mode == 1 && gAccel == ACCEL_SPPM_LEPSKI) {
+                launchLepskiFrame(state, p, stream, &lastFrame, p.frame_index == 0);
+                lastDeposits = lastFrame.photons;
+                photons_valid = false;
+            } else if (p.render_mode == 1 && gAccel == ACCEL_RTPM) {
+                // RTPM traces its own photon maps every frame, at the gather
+                // points of the renderer's camera pass.
+                updatePPMRadius(p);
+                p.culling = 0;
+                launchCameraPass(state, p, stream);
+                launchRtpmPasses(state, p, stream, &lastFrame);
+                launchAccumulatePass(p, stream);
+                lastDeposits = lastFrame.photons;
+                photons_valid = false;
+            } else if (p.render_mode == 1 && isSplatting(gAccel)) {
                 updatePPMRadius(p);
                 p.culling = 0;
                 launchCameraPass(state, p, stream);
@@ -3904,9 +4034,21 @@ int main(int argc, char** argv) {
     if (!parseAccel(args.accel, gAccel)) {
         std::cerr << "Unknown --accel value: " << args.accel
                   << " (expected brute, uniform, hash, stochastic, rect, mlhash, mlrect,"
-                     " splat, mlsplat or stochsplat)\n";
+                     " splat, mlsplat, stochsplat, sppm_lepski or rtpm)\n";
         return 2;
     }
+    if (gAccel == ACCEL_SPPM_LEPSKI && args.verifyCulling) {
+        std::cerr << "--accel sppm_lepski culls with a bitset of its own; --verify-gather"
+                     " checks it together with the grid\n";
+        return 2;
+    }
+    if (gAccel == ACCEL_RTPM && args.verifyCulling) {
+        std::cerr << "--accel rtpm culls with a mask of its own (--rtpm-culling); --verify-gather"
+                     " checks it together with the photon structures\n";
+        return 2;
+    }
+    gLepski.options = args.lepski;
+    gRtpm.options = args.rtpm;
     gFused = args.fused;
     if (gFused && (!args.offline || !args.photon || fusedIndex(gAccel) < 0 || args.culling)) {
         std::cerr << "--fused is for offline photon mapping in family A: --accel uniform, hash,"
@@ -4089,11 +4231,40 @@ int main(int argc, char** argv) {
             std::cout << "[Splat] --culling is ignored: splatting culls implicitly\n";
         gCulling = false;
     }
+    // The adaptive LoD hash-grid SPPM takes its radii from the pixel
+    // footprint and keeps them fixed — it picks a bandwidth per pixel instead
+    // of shrinking one — so it has neither the schedule nor the adaptive
+    // radius, and it culls with a bitset of its own.
+    if (gAccel == ACCEL_SPPM_LEPSKI) {
+        p.radius_mode = RADIUS_FOOTPRINT;
+        p.use_ppm = 0;
+        p.adaptive_radius = 0;
+        if (gCulling)
+            std::cout << "[sppm_lepski] --culling is ignored: the method culls with its own"
+                         " active-cell bitset\n";
+        gCulling = false;
+    }
+    // RTPM builds its photon boxes before a single photon is counted, so it
+    // cannot pick a radius from what a gather finds; and its culling is the
+    // paper's own mask (--rtpm-culling), not the renderer's.
+    if (gAccel == ACCEL_RTPM) {
+        p.adaptive_radius = 0;
+        if (gCulling)
+            std::cout << "[rtpm] --culling is ignored: RTPM culls with its own mask"
+                         " (--rtpm-culling on)\n";
+        gCulling = false;
+    }
 
     if (args.photonPaths > 0)
         p.num_photon_paths = args.photonPaths;
     if (args.maxDepth > 0)
         p.max_depth = args.maxDepth;
+    if ((gAccel == ACCEL_SPPM_LEPSKI || gAccel == ACCEL_RTPM)
+        && p.max_depth > PACKED_PHOTON_MAX_DEPTH + 1) {
+        std::cerr << "--accel " << accelName(gAccel) << " keeps a photon's bounce index in six"
+                     " bits: --depth up to " << (PACKED_PHOTON_MAX_DEPTH + 1) << "\n";
+        return 2;
+    }
     p.seed = args.seed;
     if (args.skyIntensity >= 0.f)
         p.sky_intensity = args.skyIntensity;
@@ -4141,6 +4312,8 @@ int main(int argc, char** argv) {
     }
 
     // Cleanups
+    lepskiDestroy();
+    rtpmDestroy();
     cudaFree(p.photon_map);
     cudaFree(p.photon_count);
     cudaFree(reinterpret_cast<void*>(state.dParams));

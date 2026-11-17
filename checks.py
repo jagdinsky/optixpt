@@ -24,6 +24,15 @@ wrote:
                                 camera and query passes
     python3 checks.py v7        error against time: the Knaus-Zwicker slope on
                                 the Cornell box against a path-traced reference
+    python3 checks.py v8        the adaptive LoD hash-grid SPPM (family D): the
+                                other methods' device.ptx untouched, its grid
+                                and culling against brute force on every
+                                scene, its brightness against the reference
+    python3 checks.py v9        RTPM (family E): the other methods' device.ptx
+                                untouched, its photon structures and culling
+                                against brute force on every scene, its image
+                                against the full hash grid's, its stochastic
+                                parts against the reference
     python3 checks.py diff A.exr B.exr    the image comparison on its own
 
 Images, logs and timing JSON go to build/checks/<check>/, with every setting
@@ -221,14 +230,14 @@ def renderer_dir(path):
     return path
 
 
-def render(bin_dir, out_dir, name, args):
+def render(bin_dir, out_dir, name, args, scene=SCENE, camera=CAMERA):
     """Runs one offline photon-mapped render; returns (exr, timing json, stdout)."""
     os.makedirs(out_dir, exist_ok=True)
     exr = os.path.join(out_dir, name + ".exr")
     tjson = os.path.join(out_dir, name + ".timing.json")
     log = os.path.join(out_dir, name + ".log")
-    cmd = [os.path.join(bin_dir, "renderer"), SCENE, "--offline", "--photon",
-           "--camera", CAMERA, "--float-exr", "--output", exr,
+    cmd = [os.path.join(bin_dir, "renderer"), scene, "--offline", "--photon",
+           "--camera", camera, "--float-exr", "--output", exr,
            "--timing-json", tjson] + [str(a) for a in args]
     print("  render %-66s" % name, end="", flush=True)
     r = subprocess.run(cmd, cwd=bin_dir, env=RENDER_ENV,
@@ -906,6 +915,294 @@ def check_v7(args):
     return ok_all
 
 
+# --------------------------------------------------------------------------
+# V8 — the adaptive LoD hash-grid SPPM (family D, --accel sppm_lepski)
+
+V8_SCENES = (("cornell", "scene.glb", "camera.txt"),
+             ("stadium", "stadium.glb", "stadium_camera.txt"),
+             ("rooms", "rooms.glb", "rooms_camera.txt"),
+             ("caustic", "caustic.glb", "caustic_camera.txt"))
+
+# Grid settings the structure is checked under: the defaults, cells four
+# times as wide (the size the method was specified with), and cells so narrow
+# that nearly every radius is clamped to them, with a storage roulette that
+# drops most photons.
+V8_GRIDS = (("defaults", []),
+            ("h0 0.08", ["--lepski-h0", 0.08]),
+            ("h0 0.005, roulette 3", ["--lepski-h0", 0.005, "--lepski-flux-rr", 3]))
+
+LEPSKI_LINE = re.compile(r"\[Verify\] frame (\d+)\s+(OK|FAIL)\s+sppm_lepski.*?max abs diff = (\S+)"
+                         r"\s+max rel = (\S+)\s+pixels off = (\d+)")
+# The sources as they were before the method was added (the renderer and its
+# device.ptx), if this machine still has them.
+PRE_LEPSKI = os.path.join(ROOT, "build", "pre_lepski", "build")
+
+
+def luminance_mean(planes):
+    n = len(planes["R"])
+    return (0.2126 * sum(planes["R"]) + 0.7152 * sum(planes["G"]) + 0.0722 * sum(planes["B"])) / n
+
+
+def rel_mse(planes, ref):
+    """Mean over pixels and channels of (x - ref)^2 / (ref^2 + 0.01), as eval/evalio.py."""
+    total = sum((a - b) * (a - b) / (b * b + 0.01) for c in "RGB" for a, b in zip(planes[c], ref[c]))
+    return total / (3 * len(ref["R"]))
+
+
+def check_v8(args):
+    """The adaptive LoD hash-grid SPPM.
+
+    a  The other methods' OptiX programs are the ones they were: this build's
+       device.ptx is byte for byte the frozen baseline's (build/pre_lepski,
+       when it is there).
+    b  The structure is exact.  On every scene and grid setting,
+       --verify-gather: the gather through the LoD grid over the culled map
+       against a brute-force gather over a map traced without culling.  A
+       photon lost to the culling, to a level boundary or to a block that
+       does not cover its radius would show as a difference far above
+       rounding.
+    c  The radiometry is the path tracer's.  On the Cornell box against the
+       path-traced reference: the fixed-scale estimate (no selection, so no
+       selection bias) within 0.5% of the reference's mean luminance and
+       within 0.3% of the full hash grid's at the same one-pixel radius; the
+       selected-scale image within 0.5% once it has run --frames.  Its
+       brightness at the checkpoints before that is reported, not judged, and
+       so is a run at kappa 2, the value the method was specified with: there
+       the selection starts out biased towards dark while the small scales
+       hold few photons, and the bias goes with the frames."""
+    new = renderer_dir(BUILD)
+    out = os.path.join(OUT, "v8")
+    ok_all = True
+    summary = {}
+
+    print("V8a: device.ptx against the build before the method was added")
+    if os.path.isfile(os.path.join(args.baseline, "device.ptx")):
+        import hashlib
+        digests = []
+        for d in (args.baseline, new):
+            with open(os.path.join(d, "device.ptx"), "rb") as f:
+                digests.append(hashlib.sha256(f.read()).hexdigest())
+        ok = digests[0] == digests[1]
+        ok_all &= ok
+        summary["device_ptx"] = {"before": digests[0], "after": digests[1], "ok": ok}
+        print("  before %s\n  after  %s  %s" % (digests[0], digests[1], "PASS" if ok else "FAIL"))
+    else:
+        print("  no baseline at %s; skipped" % args.baseline)
+
+    print("\nV8b: grid over the culled map against brute force over the full map,"
+          " %d frames, seed %d" % (args.verify_frames, args.seed))
+    rows = []
+    for scene, glb, cam in V8_SCENES:
+        for label, extra in V8_GRIDS:
+            common = ["--accel", "sppm_lepski", "--verify-gather", "--frames", args.verify_frames,
+                      "--seed", args.seed] + SMALL + extra
+            _, tj, stdout = render(new, out, "verify_%s_%s" % (scene, tag_of(extra) or "defaults"),
+                                   common, glb, cam)
+            frames = [m for m in map(LEPSKI_LINE.search, stdout.replace("\r", "\n").splitlines()) if m]
+            ok = "[Verify] PASS" in stdout and len(frames) == args.verify_frames
+            ok_all &= ok
+            m = timing_means(tj, 0)
+            rows.append({"scene": scene, "grid": label, "ok": ok,
+                         "max_rel": max([float(f.group(4)) for f in frames] or [float("nan")]),
+                         "pixels_off": sum(int(f.group(5)) for f in frames),
+                         "stored": m["photons"], "deposits": m["deposits"]})
+    print("\n%-8s %-22s %10s %10s %9s %9s  %s" % ("scene", "grid", "max rel", "pixels off",
+                                                  "stored", "deposits", "verdict"))
+    for r in rows:
+        print("%-8s %-22s %10s %10d %9.0f %9.0f  %s" % (
+            r["scene"], r["grid"], fmt(r["max_rel"]), r["pixels_off"], r["stored"], r["deposits"],
+            "PASS" if r["ok"] else "FAIL"))
+    print("(worst frame of each run; rounding alone is a few 1e-7)")
+    summary["verify"] = rows
+
+    print("\nV8c: brightness and error against the path-traced reference, Cornell box", flush=True)
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "eval", "render_references.py"),
+                        "--scenes", "cornell", "--frames", str(args.ref_frames), "--parts", "2"])
+    if r.returncode != 0:
+        fail("render_references.py failed")
+    ref_path = os.path.join(ROOT, "eval", "refs", "cornell_pt_d8_r1280x720_f%d_ref.exr"
+                            % (2 * args.ref_frames))
+    _, _, ref = read_exr(ref_path)
+    ref_lum = luminance_mean(ref)
+
+    def measure(path):
+        _, _, planes = read_exr(path)
+        return luminance_mean(planes) / ref_lum, rel_mse(planes, ref)
+
+    bench = BENCH + ["--seed", args.seed]
+    fixed, _, _ = render(new, out, "fixed", ["--accel", "sppm_lepski", "--lepski-view", "fixed",
+                                             "--frames", args.fixed_frames] + bench)
+    base, _, _ = render(new, out, "hash_k1", ["--accel", "hash", "--radius-mode", "footprint",
+                                              "--k-pix", 1, "--no-ppm", "--frames",
+                                              args.fixed_frames] + bench)
+    sel, _, _ = render(new, out, "selected", ["--accel", "sppm_lepski", "--frames", args.frames,
+                                              "--checkpoints"] + bench)
+    with open(sel[:-4] + ".checkpoints.json") as f:
+        checkpoints = json.load(f)["checkpoints"]
+    k2, _, _ = render(new, out, "selected_kappa2", ["--accel", "sppm_lepski", "--lepski-kappa", 2,
+                                                    "--frames", args.frames, "--checkpoints"] + bench)
+    with open(k2[:-4] + ".checkpoints.json") as f:
+        checkpoints_k2 = json.load(f)["checkpoints"]
+
+    fixed_ratio, fixed_err = measure(fixed)
+    base_ratio, base_err = measure(base)
+    points = [(cp["frames"],) + measure(cp["file"]) for cp in checkpoints]
+    points_k2 = [(cp["frames"],) + measure(cp["file"]) for cp in checkpoints_k2]
+    ok_fixed = abs(fixed_ratio - 1.0) <= 0.005
+    ok_base = abs(fixed_ratio - base_ratio) <= 0.003
+    ok_sel = abs(points[-1][1] - 1.0) <= 0.005
+    ok_all &= ok_fixed and ok_base and ok_sel
+    print("\n%-44s %7s %10s %10s  %s" % ("image", "frames", "lum / ref", "relMSE", "verdict"))
+    print("%-44s %7d %10.5f %10.3g  %s" % ("D, fixed scale (1 pixel footprint)", args.fixed_frames,
+                                           fixed_ratio, fixed_err, "PASS" if ok_fixed else "FAIL"))
+    print("%-44s %7d %10.5f %10.3g  %s" % ("A/hash/footprint, k_pix 1, no schedule",
+                                           args.fixed_frames, base_ratio, base_err,
+                                           "PASS" if ok_base else "FAIL"))
+    for i, (frames, ratio, err) in enumerate(points):
+        last = i == len(points) - 1
+        print("%-44s %7d %10.5f %10.3g  %s" % (
+            "D, selected scale (defaults)", frames, ratio, err,
+            ("PASS" if ok_sel else "FAIL") if last else "(reported)"))
+    for frames, ratio, err in points_k2:
+        print("%-44s %7d %10.5f %10.3g  (reported)" % ("D, selected scale, kappa 2", frames, ratio, err))
+    print("(fixed: within 0.5%% of the reference and 0.3%% of the hash grid at the same radius;"
+          " selected: within 0.5%% at the last checkpoint.  Reference: %s)"
+          % os.path.relpath(ref_path, ROOT))
+    summary["brightness"] = {"reference": os.path.relpath(ref_path, ROOT),
+                             "fixed": [args.fixed_frames, fixed_ratio, fixed_err],
+                             "hash_k1": [args.fixed_frames, base_ratio, base_err],
+                             "selected": points, "selected_kappa2": points_k2}
+    write_results(out, "results.json", summary)
+    print("\nV8 %s" % ("PASS" if ok_all else "FAIL"))
+    return ok_all
+
+
+# --------------------------------------------------------------------------
+# V9 — RTPM (family E, --accel rtpm)
+
+# The settings the structures are checked under: the exact defaults, the
+# paper's Photon Culling, the paper's test configuration with a caustic
+# radius of its own, a culling mask so small that most of its cells collide,
+# and per-pixel radii.
+V9_SETTINGS = (
+    ("defaults", []),
+    ("culling", ["--rtpm-culling", "on"]),
+    ("culling, reject 0.7, uniform, caustic 0.25",
+     ["--rtpm-culling", "on", "--rtpm-reject", 0.7, "--rtpm-kernel", "uniform",
+      "--rtpm-caustic-scale", 0.25]),
+    ("culling, mask 2^14", ["--rtpm-culling", "on", "--rtpm-mask-bits", 14]),
+    ("footprint, culling", ["--radius-mode", "footprint", "--rtpm-culling", "on"]),
+)
+
+RTPM_LINE = re.compile(r"\[Verify\] frame (\d+)\s+(OK|FAIL)\s+rtpm.*?max abs diff = (\S+)"
+                       r"\s+max rel = (\S+)\s+pixels off = (\d+)")
+
+
+def check_v9(args):
+    """RTPM.
+
+    a  The other methods' OptiX programs are the ones they were: this build's
+       device.ptx is byte for byte the frozen baseline's (build/pre_lepski,
+       when it is there).
+    b  The structures are exact.  On every scene and setting, --verify-gather:
+       the collection through the photon acceleration structures over the
+       culled maps against a brute-force collection over maps traced without
+       culling.
+    c  With its defaults it is the full hash grid with another search: on the
+       Cornell box, E/rtpm/global against A/hash/global over the same frames
+       — the same photon paths, gather points, tests and filter, the photons'
+       normals and directions packed to 13 and 16 bits in one and not in the
+       other.  Judged on the images' relative L2 difference (1e-4) and on
+       their mean luminance against the path-traced reference (within 0.5%
+       of it and 0.05% of each other).
+    d  Its stochastic parts are unbiased: with 70% of the global photons
+       rejected, and with Stochastic Evaluation on top, the mean luminance
+       stays within 0.5% of the reference."""
+    new = renderer_dir(BUILD)
+    out = os.path.join(OUT, "v9")
+    ok_all = True
+    summary = {}
+
+    print("V9a: device.ptx against the build before the new methods were added")
+    if os.path.isfile(os.path.join(args.baseline, "device.ptx")):
+        import hashlib
+        digests = []
+        for d in (args.baseline, new):
+            with open(os.path.join(d, "device.ptx"), "rb") as f:
+                digests.append(hashlib.sha256(f.read()).hexdigest())
+        ok = digests[0] == digests[1]
+        ok_all &= ok
+        summary["device_ptx"] = {"before": digests[0], "after": digests[1], "ok": ok}
+        print("  before %s\n  after  %s  %s" % (digests[0], digests[1], "PASS" if ok else "FAIL"))
+    else:
+        print("  no baseline at %s; skipped" % args.baseline)
+
+    print("\nV9b: structures over the culled maps against brute force over the full ones,"
+          " %d frames, seed %d" % (args.verify_frames, args.seed))
+    rows = []
+    for scene, glb, cam in V8_SCENES:
+        for label, extra in V9_SETTINGS:
+            common = ["--accel", "rtpm", "--verify-gather", "--frames", args.verify_frames,
+                      "--seed", args.seed] + SMALL + extra
+            _, tj, stdout = render(new, out, "verify_%s_%s" % (scene, tag_of(extra) or "defaults"),
+                                   common, glb, cam)
+            frames = [m for m in map(RTPM_LINE.search, stdout.replace("\r", "\n").splitlines()) if m]
+            ok = "[Verify] PASS" in stdout and len(frames) == args.verify_frames
+            ok_all &= ok
+            m = timing_means(tj, 0)
+            rows.append({"scene": scene, "setting": label, "ok": ok,
+                         "max_rel": max([float(f.group(4)) for f in frames] or [float("nan")]),
+                         "pixels_off": sum(int(f.group(5)) for f in frames),
+                         "stored": m["photons"], "deposits": m["deposits"]})
+    print("\n%-8s %-44s %10s %10s %9s %9s  %s" % ("scene", "setting", "max rel", "pixels off",
+                                                  "stored", "deposits", "verdict"))
+    for r in rows:
+        print("%-8s %-44s %10s %10d %9.0f %9.0f  %s" % (
+            r["scene"], r["setting"], fmt(r["max_rel"]), r["pixels_off"], r["stored"],
+            r["deposits"], "PASS" if r["ok"] else "FAIL"))
+    print("(worst frame of each run; rounding alone is a few 1e-7)")
+    summary["verify"] = rows
+
+    print("\nV9c, V9d: against the full hash grid and the path-traced reference, Cornell box",
+          flush=True)
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "eval", "render_references.py"),
+                        "--scenes", "cornell", "--frames", str(args.ref_frames), "--parts", "2"])
+    if r.returncode != 0:
+        fail("render_references.py failed")
+    ref_path = os.path.join(ROOT, "eval", "refs", "cornell_pt_d8_r1280x720_f%d_ref.exr"
+                            % (2 * args.ref_frames))
+    _, _, ref = read_exr(ref_path)
+    ref_lum = luminance_mean(ref)
+    bench = BENCH + ["--seed", args.seed, "--frames", args.frames]
+    runs = (("A/hash/global", ["--accel", "hash"]),
+            ("E/rtpm/global", ["--accel", "rtpm"]),
+            ("E/rtpm/global, reject 0.7", ["--accel", "rtpm", "--rtpm-reject", 0.7]),
+            ("E/rtpm/global, reject 0.7, stochastic 3",
+             ["--accel", "rtpm", "--rtpm-reject", 0.7, "--rtpm-stochastic", 3]))
+    measured = []
+    for label, extra in runs:
+        exr, _, _ = render(new, out, tag_of(extra), extra + bench)
+        _, _, planes = read_exr(exr)
+        measured.append((label, exr, luminance_mean(planes) / ref_lum, rel_mse(planes, ref)))
+    d = compare(measured[0][1], measured[1][1])
+    ok_same = d["rel_l2"] <= 1e-4 and abs(measured[0][2] - measured[1][2]) <= 5e-4
+    ok_all &= ok_same
+    print("\n%-42s %10s %10s  %s" % ("image, %d frames" % args.frames, "lum / ref", "relMSE", "verdict"))
+    for i, (label, _, ratio, err) in enumerate(measured):
+        ok = abs(ratio - 1.0) <= 0.005
+        ok_all &= ok
+        print("%-42s %10.5f %10.3g  %s" % (label, ratio, err, "PASS" if ok else "FAIL"))
+    print("E/rtpm/global against A/hash/global: rel L2 %s, max rel %s, %d values not allclose  %s"
+          % (fmt(d["rel_l2"]), fmt(d["max_rel"]), d["not_allclose"], "PASS" if ok_same else "FAIL"))
+    print("(mean luminance within 0.5%% of the reference; the two exact images within 1e-4 in"
+          " relative L2.  Reference: %s)" % os.path.relpath(ref_path, ROOT))
+    summary["images"] = [{"config": l, "lum_ratio": r_, "relmse": e} for l, _, r_, e in measured]
+    summary["rtpm_vs_hash"] = d
+    write_results(out, "results.json", summary)
+    print("\nV9 %s" % ("PASS" if ok_all else "FAIL"))
+    return ok_all
+
+
 def check_diff(args):
     d = compare(args.a, args.b)
     for k, v in d.items():
@@ -962,14 +1259,31 @@ def main():
     v7.add_argument("--frames", type=int, default=1024)
     v7.add_argument("--ref-frames", type=int, default=2048, help="frames per part of the reference")
 
+    v8 = sub.add_parser("v8", help="adaptive LoD hash-grid SPPM: exact structure, brightness")
+    v8.add_argument("--baseline", default=PRE_LEPSKI,
+                    help="directory with the renderer and device.ptx from before the method")
+    v8.add_argument("--seed", type=int, default=1)
+    v8.add_argument("--verify-frames", type=int, default=4)
+    v8.add_argument("--fixed-frames", type=int, default=64)
+    v8.add_argument("--frames", type=int, default=1024, help="frames of the selected-scale run")
+    v8.add_argument("--ref-frames", type=int, default=2048, help="frames per part of the reference")
+
+    v9 = sub.add_parser("v9", help="RTPM: exact structures, the hash grid's image, unbiased")
+    v9.add_argument("--baseline", default=PRE_LEPSKI,
+                    help="directory with the renderer and device.ptx from before the new methods")
+    v9.add_argument("--seed", type=int, default=1)
+    v9.add_argument("--verify-frames", type=int, default=4)
+    v9.add_argument("--frames", type=int, default=64, help="frames of the image comparisons")
+    v9.add_argument("--ref-frames", type=int, default=2048, help="frames per part of the reference")
+
     d = sub.add_parser("diff", help="compare two EXRs")
     d.add_argument("a")
     d.add_argument("b")
 
     args = p.parse_args()
     ok = {"v1": check_v1, "timing": check_timing, "v2": check_v2, "v3": check_v3,
-          "v4": check_v4, "v5": check_v5, "v6": check_v6, "v7": check_v7,
-          "diff": check_diff}[args.check](args)
+          "v4": check_v4, "v5": check_v5, "v6": check_v6, "v7": check_v7, "v8": check_v8,
+          "v9": check_v9, "diff": check_diff}[args.check](args)
     sys.exit(0 if ok else 1)
 
 

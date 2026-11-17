@@ -47,7 +47,7 @@ renders, and recorded in their file names when given:
 The benchmark (--bench) renders no image set.  It times the structures this
 work compares, each over the same frames, and prints the table:
 
-    python3 exec.py --bench                 # 7 configurations x 3 runs
+    python3 exec.py --bench                 # 10 configurations x 3 runs
     python3 exec.py --bench --dry-run       # the commands only
 
     hash/global                 full hash grid, one radius per frame
@@ -58,6 +58,15 @@ work compares, each over the same frames, and prints the table:
     rect/global                 rectified stochastic hash grid, one radius
     mlrect/footprint            multi-level rectified grid, per-pixel radius
     mlrect/footprint+culling    the same, with culling
+    sppm_lepski/footprint       adaptive LoD hash-grid SPPM (family D): its
+                                own grid, culling and multi-scale estimate;
+                                camera, photon, build and query are its four
+                                stages
+    rtpm/global                 RTPM (family E, Kern et al. 2023): the photons
+                                in acceleration structures, collected by an
+                                infinitely short ray; build is the structures,
+                                query the collection
+    rtpm/global+culling         the same with its Photon Culling
 
 Every run is the renderer's own per-pass timing (--timing-json), averaged
 over the frames after --bench-warmup; the table is the median over
@@ -164,11 +173,13 @@ def parse_args():
 
     e = p.add_argument_group("experiments (section 9 of the method comparison)")
     e.add_argument("--experiments", action="store_true",
-                   help="run the experiment matrix: E1-E3 (timing tables), E5-E6 (error "
-                        "against time), E7 (variance diagnostic), then --report")
+                   help="run the experiment matrix: E1-E4 (timing tables), E5-E6 (error "
+                        "against time), E7 (variance diagnostic), E8 (the adaptive LoD "
+                        "hash-grid SPPM) and E9 (every method, RTPM included): timing table "
+                        "and error against time each, then --report")
     e.add_argument("--reduced", action="store_true",
-                   help="the reduced matrix: 1 seed and 1024 frames for E5/E6, 256 frames for E7")
-    e.add_argument("--only", default="E1,E2,E3,E4,E5,E6,E7",
+                   help="the reduced matrix: 1 seed and 1024 frames for E5/E6/E8/E9, 256 frames for E7")
+    e.add_argument("--only", default="E1,E2,E3,E4,E5,E6,E7,E8,E9",
                    help="comma-separated experiments to run")
     e.add_argument("--scenes", default="cornell,stadium,rooms,caustic",
                    help="comma-separated scenes (eval/evalio.py's names)")
@@ -323,6 +334,9 @@ BENCH = (
     ("mlrect/footprint", ["--accel", "mlrect", "--radius-mode", "footprint"]),
     ("mlrect/footprint+culling", ["--accel", "mlrect", "--radius-mode", "footprint",
                                   "--culling", "on"]),
+    ("sppm_lepski/footprint", ["--accel", "sppm_lepski"]),
+    ("rtpm/global", ["--accel", "rtpm"]),
+    ("rtpm/global+culling", ["--accel", "rtpm", "--rtpm-culling", "on"]),
 )
 
 # Per-pass times, in the order a frame runs them (mark: culling only;
@@ -464,28 +478,51 @@ SAME_IMAGE = {
             "A/hash/footprint+fused", "A/mlhash/footprint+fused", "A/hash/global",
             "A/hash/global+fused", "A/rect/footprint", "A/rect/footprint+fused",
             "A/mlrect/footprint", "A/mlrect/footprint+fused"]),
+    # Families D and E do not go through the gathers' query pass, and D does
+    # not render the image the others render — its estimate is its own — so
+    # these two tables are about what a frame costs; what it buys is in the
+    # error-against-time runs of the same experiments (ERROR_RUNS).
+    "E8": ("adaptive LoD hash-grid SPPM (family D) against the hash grids",
+           ["A/hash/footprint", "B/hash/footprint+hier", "B/mlrect/footprint",
+            "D/sppm_lepski/footprint", "D/sppm_lepski/footprint+h0.08"]),
+    "E9": ("every method: one frame's passes",
+           ["A/hash/global", "A/hash/footprint", "A/hash/footprint+kpix8",
+            "B/hash/footprint+hier", "B/mlhash/footprint", "A/rect/footprint",
+            "B/mlrect/footprint", "C/mlsplat/footprint", "D/sppm_lepski/footprint",
+            "E/rtpm/global", "E/rtpm/global+cull", "E/rtpm/global+cull+reject0.7+uniform",
+            "E/rtpm/global+cull+reject0.7+uniform+stoch3", "E/rtpm/footprint+cull",
+            "B/hash/global+hier+paths300000"]),
+}
+
+# Error against GPU time (eval/error_vs_time.py), per experiment: the
+# configurations of one figure.  Footprint configurations run at k_pix 4
+# unless they say otherwise (+kpix8).
+#
+# E8: family D at its defaults, with the selection's interval the method was
+# specified with (+kappa2), and with its cell as well (+h0.08+kappa2).
+# E9: every method the renderer has.  PT is the path tracer.  RTPM is there
+# as an exact structure (E/rtpm/global, the hash grid's image), with its
+# Photon Culling (+cull), and as the paper tested it: culling, 70% of the
+# global photons rejected and the uniform kernel, without and with Stochastic
+# Evaluation (+stoch3); E/rtpm/footprint is RTPM with per-pixel radii.  The
+# last one is the control for that rejection: the culled hash grid given 30%
+# of the photon paths, so about as many photons as RTPM keeps.
+ERROR_RUNS = {
+    "E8": ["A/hash/footprint", "B/mlrect/footprint", "D/sppm_lepski/footprint",
+           "D/sppm_lepski/footprint+kappa2", "D/sppm_lepski/footprint+h0.08+kappa2"],
+    "E9": ["PT"] + SAME_IMAGE["E9"][1],
+}
+ERROR_TITLES = {
+    "E8": "adaptive LoD hash-grid SPPM, error against GPU time",
+    "E9": "every method, error against GPU time",
 }
 
 
 def config_options(label):
-    """Renderer options of '<family>/<accel>/<mode>[+F1][+K4]'."""
-    base, _, variant = label.partition("+")
-    family, accel, mode = base.split("/")
-    opts = ["--accel", accel, "--radius-mode", mode]
-    if family != "C":
-        opts += ["--culling", "on" if family == "B" else "off"]
-    for v in filter(None, variant.split("+")):
-        if v == "inline":
-            opts += ["--inline-positions"]
-        elif v == "hier":
-            opts += ["--hier-mask"]
-        elif v == "fused":
-            opts += ["--fused"]
-        elif v.startswith("F"):
-            opts += ["--splat-cell-factor", v[1:]]
-        elif v.startswith("K"):
-            opts += ["--splat-stripes", v[1:]]
-    return opts
+    """Renderer options of '<family>/<accel>/<mode>[+variant...]' (eval/evalio.py)."""
+    sys.path.insert(0, EVAL)
+    import evalio
+    return evalio.config_options(label)
 
 
 def scene_files(scene):
@@ -578,6 +615,12 @@ def experiments(args):
                       "--render", "--frames", str(256 if args.reduced else 1024),
                       "--dump-every", "16", "--pairs", "B/mlhash:B/mlrect", "A/hash:A/rect",
                       "C/mlsplat:C/stochsplat"], args.dry_run)
+        for e in which:
+            if e in ERROR_RUNS:
+                run_tool([sys.executable, os.path.join(EVAL, "error_vs_time.py"), "--scene", scene,
+                          "--render", "--frames", str(frames), "--seeds", seeds, "--k-pix", "4",
+                          "--out", os.path.join(EXPERIMENTS, e), "--configs"] + ERROR_RUNS[e],
+                         args.dry_run)
     if not args.dry_run:
         write_report()
 
@@ -608,7 +651,7 @@ def write_report():
                         m["entries"], m["buckets"]))
                 lines.append("")
     for e, title in (("E5", "stochastic against exact, error against GPU time"),
-                     ("E6", "radius policy, error against GPU time")):
+                     ("E6", "radius policy, error against GPU time")) + tuple(ERROR_TITLES.items()):
         base = os.path.join(EXPERIMENTS, e)
         if not os.path.isdir(base):
             continue

@@ -199,6 +199,170 @@ __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.gl
 //                                     run as one program (no gather points
 //                                     stored); same images
 //
+// adaptive LoD hash-grid SPPM (family D): --accel sppm_lepski  (also: lepski)
+//                    a photon mapper of its own next to the gathers and
+//                    splatting, D/sppm_lepski/footprint in logs: its own
+//                    OptiX module (sppm_lepski_device.ptx, two pipelines),
+//                    kernels and buffers (src/sppm_lepski*).  The other
+//                    methods' code is not touched — device.ptx is byte for
+//                    byte what it was — and its PTX is only loaded when it
+//                    is selected.  A frame is four stages, timed in the
+//                    usual fields:
+//                      camera  the camera walk — the other photon mappers'
+//                              jitter, specular chain and NEE, so the same
+//                              vertex and direct light — which also marks
+//                              the buckets its gather will search
+//                      photon  the photon trace — the other methods' paths —
+//                              into 32-byte photons, stored only in marked
+//                              buckets and, when weak, by roulette; first
+//                              hits are never stored (direct light is NEE)
+//                      build   a counting sort into one table of 2^22 buckets
+//                      query   the gather at five radii at once (0.25, 0.5,
+//                              1, 2, 4 x the base radius; Epanechnikov
+//                              kernel), a running mean and variance per
+//                              scale (Welford), the scale to show (Lepski's
+//                              rule: the largest whose confidence interval
+//                              meets all the smaller ones'), and the image
+//                    The base radius is one pixel's footprint over the cosine
+//                    of incidence (floored at 0.2); --k-pix is the radius of
+//                    the largest scale in footprints, so the default 4 makes
+//                    the base one pixel.  There is no radius schedule: the
+//                    radii stay and the selection moves down the scales.
+//                    The grid has one level per octave of distance from the
+//                    camera: level l holds the photons d0*2^l .. d0*2^(l+1)
+//                    away, in cells h0*2^l wide.  A radius is clamped to
+//                    0.49 cells of its level, so a 2x2x2 block per level
+//                    holds every photon within it (at most two levels).
+//                    Culling is the method's own (--culling is ignored) and,
+//                    like the grid, exact: --verify-gather compares every
+//                    frame's gather through the grid over the culled map
+//                    with a brute-force gather over a map traced without
+//                    culling.  --depth up to 64.
+//                  --lepski-d0 F      d0 as a fraction of the scene diagonal
+//                                     (default 0.01)
+//                  --lepski-h0 F      h0 as a fraction of d0 (default 0.02,
+//                                     at most 1).  The gather's cost goes
+//                                     with the cell's area: at 1280x720 the
+//                                     default tests about 250 photons per
+//                                     pixel, with radii clamped only at
+//                                     grazing angles; 0.08, the value the
+//                                     method was specified with, clamps
+//                                     nothing and tests about 3800
+//                  --lepski-max-lod N levels (default 12)
+//                  --lepski-kappa F   half-width of the selection's
+//                                     confidence intervals in standard
+//                                     errors (default 4).  At 2, the value
+//                                     the method was specified with, the
+//                                     selection is biased towards dark while
+//                                     the small scales hold few photons
+//                                     (about 1.5% of the image's brightness
+//                                     on the Cornell box at 16 frames, gone
+//                                     by 1000)
+//                  --lepski-flux-rr F photons below F x the mean emitted
+//                                     photon flux are stored with probability
+//                                     flux / threshold (at least 0.05) and
+//                                     the flux scaled up to match (default
+//                                     0.1; 0 = store every one)
+//                  --lepski-culling on|off   off stores every photon (the
+//                                     same image, to rounding)
+//                  --lepski-max-photons N    photon slots (default: paths x
+//                                     (depth - 1), at most 16M; a pass that
+//                                     outgrows them is reported)
+//                  --lepski-view V    normal    direct + indirect at the
+//                                               selected scale (default)
+//                                     indirect  indirect only
+//                                     heatmap   the selected scale: blue,
+//                                               cyan, green, yellow, red =
+//                                               0.25x .. 4x
+//                                     fixed     direct + indirect at 1x, no
+//                                               selection (the ablation)
+//                    The timing JSON gets a "lepski" record: the settings,
+//                    deposits / in active cells / stored per frame (alive
+//                    over candidates), the pixels at each scale when the run
+//                    ended, the kernels' registers.  --stats works as for
+//                    the gathers (photons read, photons within the largest
+//                    scale, buckets visited).  The GUI has the method under
+//                    Photon map > Acceleration structure, with its view,
+//                    kappa and culling.
+//
+// RTPM (family E): --accel rtpm
+//                    the hardware ray tracing photon mapper of Kern, Bruell
+//                    and Grosch, "Accelerating Photon Mapping for
+//                    Hardware-Based Ray Tracing" (JCGT 12(1), 2023),
+//                    E/rtpm/global in logs: its own OptiX module
+//                    (rtpm_device.ptx, two pipelines), kernels and buffers
+//                    (src/rtpm*).  As with family D nothing of the other
+//                    methods is touched, and its PTX is only loaded when it
+//                    is selected.  A frame is the renderer's camera pass and
+//                    then, timed in the usual fields:
+//                      mark    Photon Culling's mask (--rtpm-culling on)
+//                      photon  the photon generation — the other methods'
+//                              paths — into a caustic map (L S+ D) and a
+//                              global map, each photon a box for the
+//                              structure and a 32-byte record
+//                      build   an acceleration structure per map over this
+//                              frame's boxes, rebuilt from scratch
+//                      query   the collection: per pixel an infinitely short
+//                              ray into each structure, an intersection
+//                              program that keeps the photons whose sphere
+//                              holds the gather point, an any-hit program
+//                              that adds them up
+//                    From the paper: the structures and the inverse radius
+//                    search, the two maps with their own radii, the rejection
+//                    of global photons, Photon Culling, Stochastic
+//                    Evaluation.  From this renderer, so that it converges
+//                    to the same image and can be checked: the camera pass
+//                    and its gather points, direct light by NEE (no
+//                    first-hit photons), the shared path-length budget, the
+//                    gathers' photon tests and cone filter.  With its
+//                    defaults it is therefore an exact structure: the full
+//                    hash grid's image (A/hash/global), found another way.
+//                    --verify-gather compares every frame's collection
+//                    through the structures over the culled maps with a
+//                    brute-force one over maps traced without culling.
+//                    --radius-mode footprint works too (the boxes are then
+//                    as wide as the frame's largest radius).  --culling is
+//                    ignored: the method has its own.  --depth up to 64.
+//                  --rtpm-culling on|off   Photon Culling (default off): a
+//                                     mask of the eight cells nearest to each
+//                                     gather point, cells one photon box
+//                                     wide; photons elsewhere are not stored
+//                  --rtpm-mask-bits N the mask has 2^N cells (default 22, the
+//                                     paper's); cells that collide only let
+//                                     photons through that nobody collects
+//                  --rtpm-reject P    a global photon is stored with
+//                                     probability 1 - P and 1 / (1 - P) of
+//                                     its flux (default 0; the paper's tests
+//                                     0.7); caustic photons always are
+//                  --rtpm-stochastic K   Stochastic Evaluation: the any-hit
+//                                     program keeps K photon indices by
+//                                     reservoir sampling and only those are
+//                                     evaluated, each standing for n / K of
+//                                     the n found (default 0 = evaluate all;
+//                                     the paper's tests 3).  With a diffuse
+//                                     BSDF there is no evaluation to save:
+//                                     here it costs noise and buys no time
+//                  --rtpm-caustic-scale F  the caustic map's radius as a
+//                                     fraction of the global one (default 1)
+//                  --rtpm-kernel cone|uniform   the gathers' cone filter
+//                                     (default), or the paper's estimate,
+//                                     every photon in the disc alike
+//                  --rtpm-build fast|default|trace   the structures' build
+//                                     flags (default fast; no measurable
+//                                     difference in build or collection time
+//                                     here, fast is a third smaller)
+//                  --rtpm-max-photons N   photon slots per map (default: the
+//                                     most a pass can deposit, at most 8M)
+//                    The paper's test configuration is --rtpm-culling on
+//                    --rtpm-reject 0.7 --rtpm-stochastic 3 --rtpm-kernel
+//                    uniform.  The timing JSON gets an "rtpm" record: the
+//                    settings, deposits / in marked cells / stored per map,
+//                    the structures' memory.  --stats: boxes handed to the
+//                    intersection program and photons accepted, per pixel.
+//                    The GUI has the method under Photon map > Acceleration
+//                    structure, with its culling, rejection, list size and
+//                    caustic radius.
+//
 // error against time: --checkpoints [LIST]  at these frame counts (default:
 //                                     every power of two up to --frames) save
 //                                     the accumulated image as <out>.cpNNNN.exr
@@ -211,8 +375,18 @@ __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.gl
 //   python3 eval/render_references.py   path-traced references (eval/refs)
 //   python3 eval/error_vs_time.py       relMSE against GPU time, CSV and SVG
 //   python3 eval/variance.py            the fixed-radius variance diagnostic
-//   python3 exec.py --experiments [--reduced]   the whole matrix (E1-E7) and
-//                                     build/experiments/report.md
+//   python3 exec.py --experiments [--reduced]   the whole matrix (E1-E9) and
+//                                     build/experiments/report.md; E8 is the
+//                                     adaptive LoD hash-grid SPPM against the
+//                                     hash grids, E9 every method the
+//                                     renderer has, path tracing and RTPM
+//                                     included (--only E9 for it alone)
+//                    configurations are <family>/<accel>/<radius mode> with
+//                    variants after a +, one option each (eval/evalio.py):
+//                    B/hash/footprint+hier, A/hash/footprint+kpix8,
+//                    D/sppm_lepski/footprint+kappa2, E/rtpm/global+cull,
+//                    E/rtpm/global+cull+reject0.7+uniform+stoch3,
+//                    B/hash/global+hier+paths300000
 //   python3 scenes/make_scenes.py       the test scenes stadium, rooms,
 //                                     caustic and their camera files
 //
@@ -234,6 +408,16 @@ __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./renderer scene.gl
 //   python3 checks.py v5      rect, mlrect, stochsplat unbiased (1/sqrt(M))
 //   python3 checks.py v6      --fused renders the same images as split
 //   python3 checks.py v7      error against time: the -2/3 slope (Cornell box)
+//   python3 checks.py v8      the adaptive LoD hash-grid SPPM: device.ptx
+//                             unchanged (against build/pre_lepski/build), its
+//                             grid and culling against brute force on all
+//                             four scenes, its brightness against the
+//                             path-traced reference
+//   python3 checks.py v9      RTPM: device.ptx unchanged, its structures and
+//                             culling against brute force on all four
+//                             scenes, its image against the full hash
+//                             grid's, its rejection and Stochastic
+//                             Evaluation against the reference
 //
 // performance table: python3 exec.py --bench   (build/bench/)
 //

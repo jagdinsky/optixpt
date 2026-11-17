@@ -33,6 +33,81 @@ SCENES = {
 }
 
 
+# A configuration is <family>/<accel>/<radius mode>[+variant...], as the
+# renderer names it in its logs:
+#
+#   A  gather from the full photon map            A/hash/global
+#   B  gather from a culled map (--culling on)    B/mlhash/footprint
+#   C  splatting                                  C/mlsplat/footprint
+#   D  adaptive LoD hash-grid SPPM                D/sppm_lepski/footprint
+#   E  RTPM, photons in acceleration structures   E/rtpm/global
+#
+# and a variant sets one option of the renderer.
+FAMILIES = ("A", "B", "C", "D", "E")
+
+# Variants without a value, and those that are a prefix followed by one
+# (longest prefix first, so that "kpix8" is not read as "k" + "pix8").
+VARIANT_FLAGS = {
+    "inline": ["--inline-positions"],
+    "hier": ["--hier-mask"],
+    "fused": ["--fused"],
+    "cull": ["--rtpm-culling", "on"],          # RTPM's Photon Culling
+    "uniform": ["--rtpm-kernel", "uniform"],   # RTPM with the paper's kernel
+}
+VARIANT_VALUES = (
+    ("kappa", "--lepski-kappa"),       # kappa2
+    ("kpix", "--k-pix"),               # kpix8: radius in pixel footprints
+    ("reject", "--rtpm-reject"),       # reject0.7: rejection of global photons
+    ("stoch", "--rtpm-stochastic"),    # stoch3: Stochastic Evaluation's list
+    ("caustic", "--rtpm-caustic-scale"),
+    ("r1_", "--radius"),               # r1_0.005: initial radius, of the scene radius
+    ("paths", "--paths"),              # paths300000: photon paths per frame
+    ("h", "--lepski-h0"),              # h0.08: level-0 cell, of d0
+    ("F", "--splat-cell-factor"),      # F1
+    ("K", "--splat-stripes"),          # K4
+)
+
+
+def split_config(label):
+    """(family, accel, mode, [variants]) of a configuration label."""
+    base, _, variant = label.partition("+")
+    try:
+        family, accel, mode = base.split("/")
+    except ValueError:
+        sys.exit("configuration %r is not <family>/<accel>/<radius mode>[+variant...]" % label)
+    if family not in FAMILIES or mode not in ("global", "footprint"):
+        sys.exit("configuration %r: family %s, radius mode global or footprint"
+                 % (label, ", ".join(FAMILIES)))
+    return family, accel, mode, [v for v in variant.split("+") if v]
+
+
+def config_options(label):
+    """Renderer options of a configuration label (without --photon)."""
+    family, accel, mode, variants = split_config(label)
+    opts = ["--accel", accel, "--radius-mode", mode]
+    # C culls implicitly, D with a bitset of its own, E with the paper's mask
+    # (+cull): only the gathering families take the renderer's --culling.
+    if family in ("A", "B"):
+        opts += ["--culling", "on" if family == "B" else "off"]
+    for v in variants:
+        if v in VARIANT_FLAGS:
+            opts += VARIANT_FLAGS[v]
+            continue
+        for prefix, flag in VARIANT_VALUES:
+            value = v[len(prefix):]
+            if v.startswith(prefix) and value[:1].isdigit():
+                opts += [flag, value]
+                break
+        else:
+            sys.exit("configuration %r: unknown variant %r" % (label, v))
+    return opts
+
+
+def has_variant(label, prefix):
+    """True if the label carries a variant that starts with `prefix`."""
+    return any(v.startswith(prefix) for v in split_config(label)[3])
+
+
 def run_renderer(args, log_path):
     """Runs build/renderer with `args` (cwd build/, as it resolves ../scenes);
     its output goes to log_path.  Exits on failure."""

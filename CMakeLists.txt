@@ -15,6 +15,24 @@ target_include_directories(device_ptx PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
+# The adaptive LoD hash-grid SPPM's OptiX programs: a module of their own, so
+# that device.ptx — every other method's programs — stays byte for byte what
+# it was.
+add_library(sppm_lepski_ptx OBJECT src/sppm_lepski_device.cu)
+set_target_properties(sppm_lepski_ptx PROPERTIES CUDA_PTX_COMPILATION ON)
+target_include_directories(sppm_lepski_ptx PRIVATE
+    ${OptiX_INCLUDE}
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+# RTPM's OptiX programs, likewise a module of their own.
+add_library(rtpm_ptx OBJECT src/rtpm_device.cu)
+set_target_properties(rtpm_ptx PROPERTIES CUDA_PTX_COMPILATION ON)
+target_include_directories(rtpm_ptx PRIVATE
+    ${OptiX_INCLUDE}
+    ${CMAKE_SOURCE_DIR}/src
+)
+
 add_library(imgui STATIC
     ${CMAKE_SOURCE_DIR}/include/imgui/imgui.cpp
     ${CMAKE_SOURCE_DIR}/include/imgui/imgui_draw.cpp
@@ -41,7 +59,7 @@ target_link_libraries(imgui PUBLIC
 # main.cpp is host C++; cuda_passes.cu is compiled by nvcc into the same binary
 # (it is where the grid build's CUB kernels live).  device.cu above is a
 # different thing entirely — PTX for OptiX, never linked into the executable.
-add_executable(renderer src/main.cpp src/cuda_passes.cu)
+add_executable(renderer src/main.cpp src/cuda_passes.cu src/sppm_lepski.cu src/rtpm.cu)
 
 # "native" builds for the GPU in this machine.  Only the executable gets it:
 # device_ptx has to stay a single-architecture PTX blob.
@@ -72,4 +90,10 @@ add_custom_command(TARGET renderer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
         $<TARGET_OBJECTS:device_ptx>
         $<TARGET_FILE_DIR:renderer>/device.ptx
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_OBJECTS:sppm_lepski_ptx>
+        $<TARGET_FILE_DIR:renderer>/sppm_lepski_device.ptx
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_OBJECTS:rtpm_ptx>
+        $<TARGET_FILE_DIR:renderer>/rtpm_device.ptx
 )
